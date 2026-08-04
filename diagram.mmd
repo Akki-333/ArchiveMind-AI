@@ -1,0 +1,27 @@
+flowchart TD
+    %% Define Styles
+    classDef blueBox fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0c4a6e,font-weight:bold,rx:8px;
+    classDef greenBox fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#14532d,font-weight:bold,rx:8px;
+    classDef purpleBox fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#581c87,font-weight:bold,rx:8px;
+    classDef yellowBox fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#713f12,font-weight:bold,rx:8px;
+
+    %% Nodes
+    A[Upload PDF Document]:::blueBox
+    B[Text Chunking & Embedding]:::blueBox
+    C[(Pinecone Vector Database)]:::greenBox
+    D[User Semantic Query]:::yellowBox
+    E[Groq AI Processing]:::purpleBox
+    
+    subgraph Outputs ["Final Output"]
+        direction LR
+        F[(Neo4j Graph Database)]:::greenBox
+        G[React Flow Mind Map UI]:::blueBox
+    end
+
+    %% Connections
+    A -->|Parses Text| B
+    B -->|Stores Vectors| C
+    D -->|Searches| C
+    C -->|Returns Relevant Chunks| E
+    E -->|Extracts Entities| F
+    E -->|Streams Data| G
