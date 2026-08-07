@@ -12,11 +12,7 @@
 
 **ArchiveMind AI** is a production-grade, hybrid **GraphRAG** (Graph-enhanced Retrieval-Augmented Generation) system for ingesting, understanding, and intelligently querying complex documents. It combines a **Pinecone Vector Database** for semantic search with a **Neo4j Knowledge Graph** for entity-relationship reasoning — delivering context-aware, hallucination-resistant answers through **Groq-powered LLM inference**.
 
-Unlike simple "chat with PDF" tools, ArchiveMind extracts structured knowledge from unstructured documents, builds a queryable knowledge graph, and uses both retrieval paths to ground the LLM's responses in real data.
-
----
-
-## ✨ Key Features
+Unlike simple "chat with PDF" tools, ArchiveMind extracts structured knowledge from unstructured documents, builds a queryable knowledge graph, and uses both retrieval paths to ground the LLM's responses in real data## ✨ Key Features
 
 | Feature | Description |
 |---|---|
@@ -24,64 +20,65 @@ Unlike simple "chat with PDF" tools, ArchiveMind extracts structured knowledge f
 | **Multi-Format Document Ingestion** | Upload `.pdf`, `.docx`, `.pptx`, `.txt`, `.csv`, and `.md` files. Text is extracted, chunked, embedded, and indexed automatically. |
 | **LLM-Powered Knowledge Graph Extraction** | Uses Groq's Llama 3.3 70B to extract entities (concepts, organizations, schemes, metrics) and relationships from document chunks, stored in Neo4j. |
 | **Lazy Graph Extraction** | Graph entities are extracted at **query time** (not upload time) — scoped to the user's question for relevance and to avoid LLM rate limits. |
-| **Interactive Mind Map Visualizer** | Click any past query to dynamically generate and render its Knowledge Graph using React Flow with Dagre auto-layout. |
+| **Interactive Mind Map Visualizer** | Click any past query to dynamically generate its Knowledge Graph using React Flow. Features adaptive auto-layout and **PNG Image Export**. |
 | **Role-Based Access Control** | Separate **Admin** (ingest/delete documents) and **User** (explore/query) roles with JWT authentication and bcrypt password hashing. |
+| **Modern SaaS-Grade UI/UX** | Clean, premium sky-blue and white aesthetic. Features seamless navigation, instant message copying, and responsive design. |
 | **AI Recommendations Hub** | Analyzes a user's past chat sessions to suggest personalized topics they should explore next. |
 | **Multi-Session Chat** | Full session management — create, rename, delete chat sessions. Conversations are persisted in Neo4j with 8-message sliding context window. |
-| **Document-Scoped Queries** | Filter queries to a specific document, or search across all uploaded documents globally. |
+| **Document-Scoped Queries** | Every chat session is strictly tied to a specific document, ensuring responses are highly focused and hallucination-free. |
 | **Auto-Generated Document Profiles** | On upload, an AI-generated summary + key entities are extracted from the first 2 chunks and displayed in the chat UI. |
 
 ---
 
 ## 🏗️ System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         USER (React Frontend)                          │
-│  ┌─────────────┐  ┌─────────────────┐  ┌─────────────────────────────┐ │
-│  │  Auth Screen │  │ Admin Dashboard  │  │ User "Public Knowledge      │ │
-│  │  (Login/     │  │ (Upload, Delete, │  │  Portal" Dashboard          │ │
-│  │   Register)  │  │  Stats, Health)  │  │ (Search, Impact Checker,    │ │
-│  └─────────────┘  └─────────────────┘  │  AI Recommendations)        │ │
-│                                         └─────────────────────────────┘ │
-│  ┌──────────────────────────────┐  ┌──────────────────────────────────┐ │
-│  │     Semantic Chat Screen     │  │     Mind Map Explorer (Graph)    │ │
-│  │ • Session sidebar            │  │ • Query history sidebar          │ │
-│  │ • Document selector          │  │ • React Flow + Dagre layout      │ │
-│  │ • Document overview card     │  │ • Dynamic entity extraction      │ │
-│  │ • Markdown + code rendering  │  │ • Animated edges + labels        │ │
-│  └──────────────────────────────┘  └──────────────────────────────────┘ │
-└─────────────────────────────────────┬───────────────────────────────────┘
-                                      │ HTTP (axios)
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      FastAPI Backend (Python)                           │
-│                                                                         │
-│  main.py ─── Registers routers, CORS, health checks                    │
-│  ├── auth.py ─── JWT auth, bcrypt hashing, role-based registration     │
-│  ├── ingestion.py ─── Multi-format parsing, chunking, embedding,       │
-│  │                     Pinecone indexing, Neo4j document nodes,        │
-│  │                     AI overview profile generation                   │
-│  ├── querying.py ─── Chat sessions CRUD, RAG query pipeline,          │
-│  │                    conversation history, document deletion,          │
-│  │                    AI recommendations engine                         │
-│  ├── graph_api.py ─── Knowledge graph data, per-doc graph,            │
-│  │                     query-scoped entity extraction + highlight       │
-│  └── database.py ─── Pinecone, Neo4j, Groq, HuggingFace init          │
-└────────────┬──────────────────┬──────────────────┬──────────────────────┘
-             │                  │                  │
-             ▼                  ▼                  ▼
-     ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
-     │   Pinecone   │  │   Neo4j      │  │   Groq API       │
-     │ Vector Store │  │ AuraDB       │  │ (Llama 3.3 70B)  │
-     │              │  │              │  │                   │
-     │ • 384-dim    │  │ • Users      │  │ • Chat generation │
-     │   embeddings │  │ • Documents  │  │ • Entity          │
-     │ • Cosine     │  │ • Entities   │  │   extraction      │
-     │   similarity │  │ • Sessions   │  │ • Overview        │
-     │ • doc_id     │  │ • Messages   │  │   profiles        │
-     │   filtering  │  │ • Relations  │  │ • Recommendations │
-     └──────────────┘  └──────────────┘  └──────────────────┘
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           USER (React Frontend)                             │
+│  ┌───────────────┐  ┌─────────────────┐  ┌───────────────────────────────┐  │
+│  │  Auth Screen  │  │ Admin Dashboard │  │ User "Public Knowledge        │  │
+│  │  (Login/      │  │ (Upload, Delete,│  │  Portal" Dashboard            │  │
+│  │   Register)   │  │  Stats, Health) │  │ (Search, Impact Checker,      │  │
+│  └───────────────┘  └─────────────────┘  │  AI Recommendations)          │  │
+│                                          └───────────────────────────────┘  │
+│  ┌──────────────────────────────┐  ┌─────────────────────────────────────┐  │
+│  │     Semantic Chat Screen     │  │      Mind Map Explorer (Graph)      │  │
+│  │ • Session sidebar & history  │  │ • Query history sidebar             │  │
+│  │ • Document overview card     │  │ • React Flow + Dagre auto-layout    │  │
+│  │ • Message copy utilities     │  │ • Dynamic entity extraction         │  │
+│  │ • Markdown + code rendering  │  │ • Graph PNG Image Export            │  │
+│  └──────────────────────────────┘  └─────────────────────────────────────┘  │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ HTTP (axios)
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       FastAPI Backend (Python)                              │
+│                                                                             │
+│  main.py ─── Registers routers, CORS, health checks                         │
+│  ├── auth.py ─── JWT auth, bcrypt hashing, role-based registration          │
+│  ├── ingestion.py ─── Multi-format parsing, chunking, embedding,            │
+│  │                     Pinecone indexing, Neo4j document nodes,             │
+│  │                     AI overview profile generation                       │
+│  ├── querying.py ─── Chat sessions CRUD, RAG query pipeline,                │
+│  │                    conversation history, document deletion,              │
+│  │                    AI recommendations engine                             │
+│  ├── graph_api.py ─── Knowledge graph data, per-doc graph,                  │
+│  │                     query-scoped entity extraction + highlight           │
+│  └── database.py ─── Pinecone, Neo4j, Groq, HuggingFace init                │
+└────────────┬───────────────────┬───────────────────┬────────────────────────┘
+             │                   │                   │
+             ▼                   ▼                   ▼
+     ┌───────────────┐   ┌───────────────┐   ┌───────────────────┐
+     │   Pinecone    │   │   Neo4j       │   │   Groq API        │
+     │ Vector Store  │   │ AuraDB        │   │ (Llama 3.3 70B)   │
+     │               │   │               │   │                   │
+     │ • 384-dim     │   │ • Users       │   │ • Chat generation │
+     │   embeddings  │   │ • Documents   │   │ • Entity          │
+     │ • Cosine      │   │ • Entities    │   │   extraction      │
+     │   similarity  │   │ • Sessions    │   │ • Overview        │
+     │ • doc_id      │   │ • Messages    │   │   profiles        │
+     │   filtering   │   │ • Relations   │   │ • Recommendations │
+     └───────────────┘   └───────────────┘   └───────────────────┘
 ```
 
 ---
