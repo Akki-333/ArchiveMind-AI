@@ -254,7 +254,7 @@ venv\Scripts\activate
 # source venv/bin/activate
 
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+python main.py
 ```
 The API will be live at `http://localhost:8000`. Verify at `http://localhost:8000/health/db`.
 
