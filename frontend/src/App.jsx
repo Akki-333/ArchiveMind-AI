@@ -6,6 +6,7 @@ import ReactMarkdown from 'react-markdown';
 import { ReactFlow, Controls, Background, Handle, Position, MarkerType, useReactFlow, ReactFlowProvider } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
+import logoImg from './assets/logo.jpg';
 
 // --- CUSTOM REACT FLOW NODE ---
 const CustomEntityNode = ({ data }) => {
@@ -106,10 +107,8 @@ const AuthScreen = ({ onLogin }) => {
       
       <div className="w-full max-w-md p-8 bg-white rounded-2xl shadow-xl border border-slate-200 relative z-10 animate-fade-in">
         <div className="text-center mb-10">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-sky-50 border border-sky-200 text-sky-500 mb-4 shadow-sm">
-            <Network size={32} />
-          </div>
-          <h1 className="text-3xl font-bold text-slate-900 tracking-tight">ArchiveMind AI</h1>
+          <img src={logoImg} alt="ArchiveMind AI" className="w-20 h-20 mx-auto mb-4 rounded-2xl shadow-sm border border-slate-200 object-cover" />
+          <h1 className="text-3xl font-bold text-slate-900 tracking-tight">ArchiveMind <span className="text-sky-500">AI</span></h1>
           <p className="text-slate-600 mt-2 text-sm">{isLogin ? 'Welcome back. Please sign in.' : 'Create your account to begin.'}</p>
         </div>
 
@@ -1115,33 +1114,49 @@ const GraphScreenContent = ({ messages, currentSessionId, documents, sessions })
             </p>
           </div>
           
-          <div className="flex gap-4">
+          <div className="flex gap-4 items-center">
             <div className="bg-white p-3 rounded-xl border border-slate-200 shadow-sm text-sm text-slate-600 flex gap-5 items-center">
               <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-sky-100 border border-sky-400"></div> Entities</div>
               <div className="flex items-center gap-2"><div className="w-5 h-0.5 bg-sky-400"></div> Relationships</div>
             </div>
             
-            <button
-              onClick={() => {
-                const el = document.querySelector('.react-flow__viewport');
-                if (!el) return;
-                const svgClone = el.closest('svg')?.cloneNode(true);
-                if (!svgClone) return;
-                svgClone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-                const svgData = new XMLSerializer().serializeToString(svgClone);
-                const blob = new Blob([svgData], { type: 'image/svg+xml' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `knowledge-graph-${Date.now()}.svg`;
-                a.click();
-                URL.revokeObjectURL(url);
-              }}
-              className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors shadow-md graph-download-btn"
-              title="Download Graph as SVG"
-            >
-              <Download size={16} /> Download Graph
-            </button>
+            {nodes.length > 0 && (
+              <button
+                onClick={() => {
+                  const flowEl = document.querySelector('.react-flow');
+                  if (!flowEl) return;
+                  const svgEl = flowEl.querySelector('svg.react-flow__viewport, svg');
+                  if (!svgEl) return;
+                  const svgClone = svgEl.cloneNode(true);
+                  svgClone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+                  const { width, height } = flowEl.getBoundingClientRect();
+                  svgClone.setAttribute('width', width);
+                  svgClone.setAttribute('height', height);
+                  const svgData = new XMLSerializer().serializeToString(svgClone);
+                  const canvas = document.createElement('canvas');
+                  const scale = 2;
+                  canvas.width = width * scale;
+                  canvas.height = height * scale;
+                  const ctx = canvas.getContext('2d');
+                  ctx.scale(scale, scale);
+                  const img = new Image();
+                  img.onload = () => {
+                    ctx.fillStyle = '#1a1b1f';
+                    ctx.fillRect(0, 0, width, height);
+                    ctx.drawImage(img, 0, 0, width, height);
+                    const link = document.createElement('a');
+                    link.download = `knowledge-graph-${Date.now()}.png`;
+                    link.href = canvas.toDataURL('image/png');
+                    link.click();
+                  };
+                  img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
+                }}
+                className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors shadow-md graph-download-btn"
+                title="Download Graph as PNG"
+              >
+                <Download size={16} /> Download as Image
+              </button>
+            )}
           </div>
         </div>
         
@@ -1303,9 +1318,7 @@ const App = () => {
           
           <div className="p-6 pb-5 border-b border-slate-200">
             <div className="flex items-center gap-3 text-slate-900 font-bold text-lg tracking-tight">
-              <div className="bg-sky-500 text-white p-2 rounded-xl shadow-md">
-                <Network size={22} />
-              </div>
+              <img src={logoImg} alt="Logo" className="w-10 h-10 rounded-xl shadow-md object-cover" />
               <span>ArchiveMind <span className="text-sky-500">AI</span></span>
             </div>
           </div>
