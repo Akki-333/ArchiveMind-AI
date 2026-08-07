@@ -1,42 +1,46 @@
+/* ArchiveMind AI — Custom Styles */
+
+/* Remove Vite defaults */
 #root {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
+  min-height: 100vh;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
+/* Prose overrides for AI chat messages in light theme */
+.prose-chat p {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
 }
 
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+.prose-chat ul, .prose-chat ol {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
-  }
+.prose-chat h1, .prose-chat h2, .prose-chat h3 {
+  margin-top: 0.75em;
+  margin-bottom: 0.25em;
+  color: #0f172a;
 }
 
-.card {
-  padding: 2em;
+.prose-chat code {
+  color: #0369a1;
+  background: #f0f9ff;
+  padding: 0.15em 0.4em;
+  border-radius: 0.25em;
+  font-size: 0.875em;
 }
 
-.read-the-docs {
-  color: #888;
+/* Smooth page transitions */
+.page-enter {
+  animation: fadeIn 0.3s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Graph download button hover */
+.graph-download-btn:hover {
+  box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25);
 }
