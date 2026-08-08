@@ -172,6 +172,78 @@ async def rename_chat_session(session_id: str, request: ChatSessionUpdate, usern
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/stats")
+async def get_user_stats(username: str = Depends(get_current_user)):
+    """Real-time stats for the current logged-in user: entity count and top concepts."""
+    try:
+        with neo4j_driver.session() as session:
+            # Get top extracted concepts from key_entities stored on Document nodes
+            doc_result = session.run("""
+                MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document)
+                RETURN d.key_entities AS key_entities
+            """, username=username)
+
+            entity_counts = {}
+            for record in doc_result:
+                try:
+                    import json
+                    entities = json.loads(record["key_entities"] or "[]")
+                    ignore_words = {"document", "report", "file", "page", "data", "information", "summary", "details", "analysis", "content", "overview"}
+                    for e in entities:
+                        clean = e.strip()
+                        if clean and len(clean) > 3 and clean.lower() not in ignore_words:
+                            entity_counts[clean] = entity_counts.get(clean, 0) + 1
+                except Exception:
+                    pass
+            
+            total_unique_entities = len(entity_counts)
+            top_entities = sorted(entity_counts.items(), key=lambda x: -x[1])[:15]
+            top_entities_list = [{"name": k, "count": v} for k, v in top_entities]
+
+            return {
+                "total_entities": total_unique_entities,
+                "top_entities": top_entities_list
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/chat/recommendations")
+async def get_chat_recommendations(username: str = Depends(get_current_user)):
+    """Generate 3 dynamic topics based on user's documents."""
+    try:
+        with neo4j_driver.session() as session:
+            doc_result = session.run("""
+                MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document)
+                RETURN d.key_entities AS key_entities
+            """, username=username)
+
+            entity_counts = {}
+            for record in doc_result:
+                try:
+                    import json
+                    entities = json.loads(record["key_entities"] or "[]")
+                    ignore_words = {"document", "report", "file", "page", "data", "information", "summary", "details", "analysis", "content", "overview", "government", "india", "state"}
+                    for e in entities:
+                        clean = e.strip()
+                        # Only include multi-word phrases or specific capitalized terms that look like topics
+                        if clean and len(clean) > 4 and clean.lower() not in ignore_words:
+                            entity_counts[clean] = entity_counts.get(clean, 0) + 1
+                except Exception:
+                    pass
+            
+            # Sort by frequency
+            top_entities = sorted(entity_counts.items(), key=lambda x: -x[1])
+            
+            # Get top 3, or fallback
+            recommendations = [k for k, v in top_entities[:3]]
+            
+            if not recommendations:
+                recommendations = ["Public Health", "Tax Policies", "Education Reform"]
+                
+            return {"recommendations": recommendations}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 class ChatSessionDocUpdate(BaseModel):
     doc_id: str
 
@@ -280,8 +352,19 @@ async def chat_with_archive(request: ChatRequest, username: str = Depends(get_cu
                 
             # Auto-title logic: if this is the first message in the session, update the title
             if len(history_records) <= 1:
-                # Truncate the user's first message to 30 chars for a simple title
-                title = user_query[:30] + ("..." if len(user_query) > 30 else "")
+                # Use AI to generate a catchy 2-3 word title
+                try:
+                    title_prompt = ChatPromptTemplate.from_messages([
+                        ("system", "You are a title generator. Given a user's message, generate a catchy, short title of EXACTLY 2-3 words that captures its essence. Return ONLY the title, nothing else. No quotes, no punctuation at the end."),
+                        ("human", "{message}")
+                    ])
+                    title_chain = title_prompt | llm | StrOutputParser()
+                    title = title_chain.invoke({"message": user_query}).strip().strip('"').strip("'")[:40]
+                    if not title or len(title) < 3:
+                        raise ValueError("Bad title")
+                except Exception:
+                    words = user_query.split()[:3]
+                    title = " ".join(words)
                 session.run("""
                     MATCH (s:ChatSession {id: $session_id})
                     SET s.title = $title
