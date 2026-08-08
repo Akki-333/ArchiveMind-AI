@@ -12,7 +12,7 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_pinecone import PineconeVectorStore
-from database import pc, index_name, embeddings_model, llm, neo4j_driver
+from database import pc, index_name, get_embeddings, llm, neo4j_driver
 
 router = APIRouter()
 
@@ -121,7 +121,7 @@ async def upload_document(file: UploadFile = File(...), username: str = Depends(
         # 3. Vector Brain: Push to Pinecone
         PineconeVectorStore.from_documents(
             documents, 
-            embeddings_model, 
+            get_embeddings(), 
             index_name=index_name
         )
 

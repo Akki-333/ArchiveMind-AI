@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from database import pc, index_name, embeddings_model, llm, neo4j_driver
+from database import pc, index_name, get_embeddings, llm, neo4j_driver
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_pinecone import PineconeVectorStore
@@ -225,7 +225,7 @@ async def get_chat_history(session_id: str, username: str = Depends(get_current_
         raise HTTPException(status_code=500, detail=str(e))
 
 def query_pinecone(query: str, doc_id: str = None, top_k: int = 15, threshold: float = 0.0):
-    vector_store = PineconeVectorStore(index_name=index_name, embedding=embeddings_model)
+    vector_store = PineconeVectorStore(index_name=index_name, embedding=get_embeddings())
     if doc_id:
         results = vector_store.similarity_search_with_score(query, k=top_k, filter={"doc_id": doc_id})
     else:
