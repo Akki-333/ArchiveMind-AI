@@ -1,8 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from database import neo4j_driver
 from querying import query_pinecone
 from ingestion import extraction_chain, parser
+from auth import get_current_user
 
 router = APIRouter()
 
@@ -49,7 +50,7 @@ class HighlightRequest(BaseModel):
     doc_id: str | None = None
 
 @router.post("/highlight")
-async def highlight_graph(request: HighlightRequest):
+async def highlight_graph(request: HighlightRequest, username: str = Depends(get_current_user)):
     try:
         user_query = request.query
         doc_id = request.doc_id
