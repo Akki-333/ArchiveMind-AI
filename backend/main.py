@@ -52,4 +52,6 @@ def check_db_connections():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # In production (like Render), use the PORT environment variable. Locally, default to 8000.
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
