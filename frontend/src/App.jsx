@@ -8,6 +8,8 @@ import '@xyflow/react/dist/style.css';
 import dagre from 'dagre';
 import logoImg from './assets/logo.jpg';
 
+// Configure Axios Base URL dynamically
+axios.defaults.baseURL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 // --- CUSTOM REACT FLOW NODE ---
 const CustomEntityNode = ({ data }) => {
   return (
@@ -87,7 +89,7 @@ const AuthScreen = ({ onLogin }) => {
     try {
       const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
       const payload = isLogin ? { username, password } : { username, password, role };
-      const response = await axios.post(`http://127.0.0.1:8000${endpoint}`, payload);
+      const response = await axios.post(`${endpoint}`, payload);
       
       if (response.data) { 
         localStorage.setItem('token', response.data.access_token);
@@ -208,7 +210,7 @@ const UserDashboard = ({ username, documents, sessions, setSessions, setCurrentS
   useEffect(() => {
     const fetchRecommendations = async () => {
       try {
-        const res = await axios.get('http://127.0.0.1:8000/api/chat/recommendations');
+        const res = await axios.get('/api/chat/recommendations');
         setRecommendations(res.data.recommendations || []);
       } catch (e) {
         console.error(e);
@@ -248,7 +250,7 @@ const UserDashboard = ({ username, documents, sessions, setSessions, setCurrentS
     } else {
       try {
         const title = doc.filename;
-        const res = await axios.post('http://127.0.0.1:8000/api/chat/sessions', { title: title, doc_id: doc.id });
+        const res = await axios.post('/api/chat/sessions', { title: title, doc_id: doc.id });
         setSessions(prev => [res.data, ...prev]);
         setCurrentSessionId(res.data.id);
       } catch (err) {
@@ -363,7 +365,7 @@ const Dashboard = ({ username, documents, sessions, setSessions, setCurrentSessi
     } else {
       try {
         const title = doc.filename;
-        const res = await axios.post('http://127.0.0.1:8000/api/chat/sessions', { title: title, doc_id: doc.id });
+        const res = await axios.post('/api/chat/sessions', { title: title, doc_id: doc.id });
         setSessions(prev => [res.data, ...prev]);
         setCurrentSessionId(res.data.id);
       } catch (err) {
@@ -399,7 +401,7 @@ const Dashboard = ({ username, documents, sessions, setSessions, setCurrentSessi
   const handleDeleteDoc = async (docId) => {
     if (window.confirm("Are you sure you want to completely delete this document from Pinecone, Neo4j, and the database?")) {
       try {
-        await axios.delete(`http://127.0.0.1:8000/api/documents/${docId}`);
+        await axios.delete(`/api/documents/${docId}`);
         if (fetchDocuments) fetchDocuments();
       } catch (err) {
         alert("Failed to delete document: " + (err.response?.data?.detail || err.message));
@@ -548,7 +550,7 @@ const UploadScreen = ({ documents, onUploadSuccess }) => {
     formData.append('file', file);
     
     try {
-      const response = await axios.post('http://127.0.0.1:8000/api/upload', formData, {
+      const response = await axios.post('/api/upload', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
       setStatus('Success: ' + response.data.message);
@@ -564,7 +566,7 @@ const UploadScreen = ({ documents, onUploadSuccess }) => {
     if(!window.confirm("Are you sure you want to completely erase this document and its graph data?")) return;
     setDeletingDocs(prev => ({ ...prev, [docId]: true }));
     try {
-      await axios.delete(`http://127.0.0.1:8000/api/documents/${docId}`);
+      await axios.delete(`/api/documents/${docId}`);
       if (onUploadSuccess) onUploadSuccess();
     } catch (err) {
       setStatus('Error deleting document: ' + (err.response?.data?.detail || err.message));
@@ -730,7 +732,7 @@ const ChatScreen = ({ sessions, setSessions, currentSessionId, setCurrentSession
 
   const handleCreateChat = async () => {
     try {
-      const res = await axios.post('http://127.0.0.1:8000/api/chat/sessions', { title: "New Chat" });
+      const res = await axios.post('/api/chat/sessions', { title: "New Chat" });
       setSessions(prev => [res.data, ...prev]);
       setCurrentSessionId(res.data.id);
     } catch(err) {
@@ -741,7 +743,7 @@ const ChatScreen = ({ sessions, setSessions, currentSessionId, setCurrentSession
   const handleDeleteChat = async (id, e) => {
     e.stopPropagation();
     try {
-      await axios.delete(`http://127.0.0.1:8000/api/chat/sessions/${id}`);
+      await axios.delete(`/api/chat/sessions/${id}`);
       setSessions(prev => prev.filter(s => s.id !== id));
       if (currentSessionId === id) {
         setCurrentSessionId(null);
@@ -760,7 +762,7 @@ const ChatScreen = ({ sessions, setSessions, currentSessionId, setCurrentSession
     }
     
     try {
-      await axios.put(`http://127.0.0.1:8000/api/chat/sessions/${id}`, { title: editTitle });
+      await axios.put(`/api/chat/sessions/${id}`, { title: editTitle });
       setSessions(prev => prev.map(s => s.id === id ? { ...s, title: editTitle } : s));
       setEditingSessionId(null);
     } catch (err) {
@@ -782,7 +784,7 @@ const ChatScreen = ({ sessions, setSessions, currentSessionId, setCurrentSession
        try {
          const title = documents.length > 0 ? documents[0].filename : "New Chat";
          const docId = documents.length > 0 ? documents[0].id : null;
-         const res = await axios.post('http://127.0.0.1:8000/api/chat/sessions', { title: title, doc_id: docId });
+         const res = await axios.post('/api/chat/sessions', { title: title, doc_id: docId });
          setSessions(prev => [res.data, ...prev]);
          activeSessionId = res.data.id;
          setCurrentSessionId(activeSessionId);
@@ -801,12 +803,12 @@ const ChatScreen = ({ sessions, setSessions, currentSessionId, setCurrentSession
 
     try {
       const payload = { message: queryText, session_id: activeSessionId };
-      const response = await axios.post('http://127.0.0.1:8000/api/chat', payload);
+      const response = await axios.post('/api/chat', payload);
       setMessages(prev => [...prev, { role: 'ai', content: response.data.answer }]);
       
       // Fetch sessions again to update the title if it auto-generated on first message
       if (messages.length === 0) {
-        const res = await axios.get('http://127.0.0.1:8000/api/chat/sessions');
+        const res = await axios.get('/api/chat/sessions');
         setSessions(res.data.sessions);
       }
     } catch (err) {
@@ -1028,7 +1030,7 @@ const GraphScreenContent = ({ messages, currentSessionId, documents, sessions })
     setEdges([]);
     
     try {
-      const response = await axios.post('http://127.0.0.1:8000/api/graph/highlight', { 
+      const response = await axios.post('/api/graph/highlight', { 
         query: queryText,
         doc_id: activeDocId 
       });
@@ -1227,7 +1229,7 @@ const App = () => {
   const fetchDocuments = useCallback(async () => {
     if (isAuthenticated) {
       try {
-        const res = await axios.get(`http://127.0.0.1:8000/api/documents?t=${new Date().getTime()}`);
+        const res = await axios.get(`/api/documents?t=${new Date().getTime()}`);
         setDocuments(res.data.documents);
       } catch (e) {
         console.error("Failed to load documents", e);
@@ -1253,7 +1255,7 @@ const App = () => {
     const fetchSessions = async () => {
       if (isAuthenticated) {
         try {
-          const res = await axios.get('http://127.0.0.1:8000/api/chat/sessions');
+          const res = await axios.get('/api/chat/sessions');
           setSessions(res.data.sessions);
           if (res.data.sessions.length > 0 && !currentSessionId) {
             setCurrentSessionId(res.data.sessions[0].id);
@@ -1273,7 +1275,7 @@ const App = () => {
     const fetchHistory = async () => {
       if (isAuthenticated && currentSessionId) {
         try {
-          const res = await axios.get(`http://127.0.0.1:8000/api/chat/history/${currentSessionId}`);
+          const res = await axios.get(`/api/chat/history/${currentSessionId}`);
           setMessages(res.data.messages);
         } catch (e) {
           console.error("Failed to load history", e);
