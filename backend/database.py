@@ -15,7 +15,14 @@ index_name = os.getenv("PINECONE_INDEX_NAME", "archivemind-index")
 pc = Pinecone(api_key=pinecone_api_key)
 
 # We will use HuggingFace embeddings (384 dimensions) just like in the PoC
-embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+_embeddings_model = None
+
+def get_embeddings():
+    global _embeddings_model
+    if _embeddings_model is None:
+        print("Lazy-loading HuggingFace embeddings model...")
+        _embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return _embeddings_model
 
 # Check if index exists, though the user already created it manually
 def get_pinecone_index():
