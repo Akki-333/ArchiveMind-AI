@@ -1,18 +1,18 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import ReactMarkdown from 'react-markdown';
 import {
   ArrowRight, Clock, FileText, Key, MessageSquare, Network,
-  Tag, Trash2, UploadCloud, User, AlertTriangle, HelpCircle, BarChart3,
-  GitCompare, CheckCircle2, Users,
+  Tag, Trash2, UploadCloud, User, AlertTriangle, Sparkles, BarChart3,
+  GitCompare, CheckCircle2, Users, ShieldCheck, Building2,
 } from 'lucide-react';
 
 import {
   compareDocuments, createSession, deleteDocument, errorMessage,
-  fetchAnalytics, fetchRecommendations, fetchStats, fetchUnanswered,
+  fetchAnalytics, fetchCoverage, fetchRecommendations, fetchStats,
   fetchUsers, login, register, saveSession, updateUserRole, uploadDocument,
 } from '../api';
-import { Citations, CodeBlock, EmptyState, Spinner, SystemHealth } from '../components/common';
+import { Citations, EmptyState, Spinner, SystemHealth } from '../components/common';
+import { Answer } from '../components/Answer';
 import logoImg from '../assets/logo.jpg';
 
 // =============================================================================
@@ -27,20 +27,42 @@ import logoImg from '../assets/logo.jpg';
  * entirely server-side: named in ADMIN_USERNAMES, or granted to the first
  * account created on an empty database.
  */
+const ACCOUNT_TYPES = [
+  { key: 'citizen', label: 'Citizen', hint: 'Read and question the public archive' },
+  { key: 'researcher', label: 'Researcher', hint: 'Analyse and compare policy documents' },
+  { key: 'official', label: 'Government official', hint: 'Manage the archive with an access code' },
+];
+
 export const AuthScreen = ({ onLogin }) => {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [details, setDetails] = useState({
+    full_name: '',
+    email: '',
+    account_type: 'citizen',
+    organisation: '',
+    designation: '',
+    access_code: '',
+  });
+
+  const isOfficial = details.account_type === 'official';
+  const setDetail = (key, value) => setDetails((prev) => ({ ...prev, [key]: value }));
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
     setLoading(true);
     try {
-      const data = isLogin ? await login(username, password) : await register(username, password);
+      const data = isLogin
+        ? await login(username, password)
+        : await register(username, password, details);
       saveSession(data);
+      // A downgraded official is told plainly rather than silently handed a
+      // reader account they believe is an administrator one.
+      if (data.pending_admin_request) window.alert(data.message);
       onLogin(data.username, data.role);
     } catch (err) {
       setError(errorMessage(err, 'Sign-in failed. Please try again.'));
@@ -50,7 +72,11 @@ export const AuthScreen = ({ onLogin }) => {
 
   return (
     <div className="bg-gradient-to-br from-sky-50 via-white to-sky-50/30 min-h-screen flex items-center justify-center font-sans p-4">
-      <div className="w-full max-w-md p-8 bg-white rounded-2xl shadow-xl border border-slate-200 animate-fade-in">
+      <div
+        className={`w-full ${
+          isLogin ? 'max-w-md' : 'max-w-lg'
+        } p-8 bg-white rounded-2xl shadow-xl border border-slate-200 animate-fade-in max-h-[92vh] overflow-y-auto custom-scrollbar`}
+      >
         <div className="text-center mb-8">
           <img
             src={logoImg}
@@ -72,6 +98,132 @@ export const AuthScreen = ({ onLogin }) => {
         )}
 
         <form onSubmit={handleSubmit} className="space-y-5">
+          {/*
+            Who are you? Asked at sign-up so citizens, researchers and officials
+            are distinguishable from the first screen. Note that this chooses a
+            *profile*, not a permission: picking "Government official" without a
+            valid access code creates a reader account with a pending request.
+            The server decides the role either way - see backend/auth.py.
+          */}
+          {!isLogin && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                I am signing up as
+              </label>
+              <div className="grid grid-cols-3 gap-2">
+                {ACCOUNT_TYPES.map((type) => (
+                  <button
+                    key={type.key}
+                    type="button"
+                    onClick={() => setDetail('account_type', type.key)}
+                    title={type.hint}
+                    className={`px-2 py-2.5 rounded-xl border text-[11px] font-semibold transition-all leading-tight ${
+                      details.account_type === type.key
+                        ? 'bg-sky-50 border-sky-400 text-sky-700 ring-1 ring-sky-400'
+                        : 'bg-white border-slate-200 text-slate-500 hover:border-sky-200'
+                    }`}
+                  >
+                    {type.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-400 mt-2">
+                {ACCOUNT_TYPES.find((t) => t.key === details.account_type)?.hint}
+              </p>
+            </div>
+          )}
+
+          {!isLogin && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                  Full name
+                </label>
+                <input
+                  type="text"
+                  value={details.full_name}
+                  onChange={(e) => setDetail('full_name', e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 text-slate-900 rounded-xl py-3 px-4 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 placeholder-slate-400 text-sm"
+                  placeholder="Your name"
+                  maxLength={120}
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                  Email
+                </label>
+                <input
+                  type="email"
+                  value={details.email}
+                  onChange={(e) => setDetail('email', e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 text-slate-900 rounded-xl py-3 px-4 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 placeholder-slate-400 text-sm"
+                  placeholder="you@example.com"
+                  maxLength={160}
+                  required
+                />
+              </div>
+            </div>
+          )}
+
+          {!isLogin && (details.account_type !== 'citizen') && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                  {isOfficial ? 'Department' : 'Institution'}
+                </label>
+                <input
+                  type="text"
+                  value={details.organisation}
+                  onChange={(e) => setDetail('organisation', e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 text-slate-900 rounded-xl py-3 px-4 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 placeholder-slate-400 text-sm"
+                  placeholder={isOfficial ? 'Ministry or department' : 'University or organisation'}
+                  maxLength={160}
+                  required={isOfficial}
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                  Designation
+                </label>
+                <input
+                  type="text"
+                  value={details.designation}
+                  onChange={(e) => setDetail('designation', e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 text-slate-900 rounded-xl py-3 px-4 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 placeholder-slate-400 text-sm"
+                  placeholder="Your role or title"
+                  maxLength={120}
+                />
+              </div>
+            </div>
+          )}
+
+          {!isLogin && isOfficial && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                Official access code
+              </label>
+              <div className="relative">
+                <ShieldCheck
+                  className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400"
+                  size={18}
+                />
+                <input
+                  type="password"
+                  value={details.access_code}
+                  onChange={(e) => setDetail('access_code', e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-300 text-slate-900 rounded-xl py-3 pl-12 pr-4 focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 placeholder-slate-400 text-sm"
+                  placeholder="Issued by your administrator"
+                  maxLength={128}
+                />
+              </div>
+              <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                Optional. Without it you can still sign up — your account is created as a
+                reader and an administrator can approve official access afterwards.
+              </p>
+            </div>
+          )}
+
           <div>
             <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
               Username
@@ -147,6 +299,38 @@ const StatTile = ({ label, value, sub, accent = 'text-slate-900 dark:text-white'
     {sub && <p className="text-xs text-slate-400 mt-2">{sub}</p>}
   </div>
 );
+
+/** A single glanceable number for how much of what people ask, the archive answers. */
+const CoverageRing = ({ value }) => {
+  const pct = value == null ? null : Math.round(value * 100);
+  const circumference = 2 * Math.PI * 26;
+  const filled = pct == null ? 0 : (pct / 100) * circumference;
+  const tone = pct == null ? '#cbd5e1' : pct >= 80 ? '#10b981' : pct >= 55 ? '#0ea5e9' : '#f59e0b';
+
+  return (
+    <div className="relative w-[68px] h-[68px] shrink-0">
+      <svg viewBox="0 0 68 68" className="w-full h-full -rotate-90">
+        <circle cx="34" cy="34" r="26" fill="none" strokeWidth="7" className="stroke-slate-100 dark:stroke-slate-700" />
+        <circle
+          cx="34"
+          cy="34"
+          r="26"
+          fill="none"
+          strokeWidth="7"
+          strokeLinecap="round"
+          stroke={tone}
+          strokeDasharray={`${filled} ${circumference}`}
+        />
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-sm font-bold text-slate-900 dark:text-white tabular-nums leading-none">
+          {pct == null ? '—' : `${pct}%`}
+        </span>
+        <span className="text-[8px] text-slate-400 uppercase tracking-wider mt-0.5">covered</span>
+      </div>
+    </div>
+  );
+};
 
 const useDocumentJump = (sessions, setSessions, setCurrentSessionId) => {
   const navigate = useNavigate();
@@ -296,17 +480,17 @@ export const Dashboard = ({
 }) => {
   const [stats, setStats] = useState(null);
   const [analytics, setAnalytics] = useState(null);
-  const [unanswered, setUnanswered] = useState([]);
+  const [coverage, setCoverage] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const jump = useDocumentJump(sessions, setSessions, setCurrentSessionId);
 
   useEffect(() => {
-    Promise.allSettled([fetchStats(), fetchAnalytics(), fetchUnanswered(8)])
-      .then(([s, a, u]) => {
+    Promise.allSettled([fetchStats(), fetchAnalytics(), fetchCoverage()])
+      .then(([s, a, c]) => {
         if (s.status === 'fulfilled') setStats(s.value);
         if (a.status === 'fulfilled') setAnalytics(a.value);
-        if (u.status === 'fulfilled') setUnanswered(u.value);
+        if (c.status === 'fulfilled') setCoverage(c.value);
       })
       .finally(() => setLoading(false));
   }, [documents]);
@@ -358,52 +542,96 @@ export const Dashboard = ({
           sub={`${analytics?.last_24h ?? 0} in the last 24h`}
         />
         <StatTile
-          label="Answer rate"
-          value={
-            loading || analytics?.answer_rate == null
-              ? '--'
-              : `${Math.round(analytics.answer_rate * 100)}%`
+          label="Questions answered"
+          value={loading ? '--' : analytics?.answered ?? 0}
+          sub={
+            analytics?.answer_rate != null
+              ? `${Math.round(analytics.answer_rate * 100)}% of everything asked`
+              : 'from your documents'
           }
-          sub={`${analytics?.unanswered ?? 0} unanswered`}
-          accent={
-            analytics?.answer_rate != null && analytics.answer_rate < 0.7
-              ? 'text-amber-500'
-              : 'text-slate-900 dark:text-white'
-          }
+          accent="text-sky-500"
         />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-        {/* Unanswered questions - the ingestion backlog */}
+        {/*
+          Archive coverage.
+
+          This panel used to be titled "What the archive could not answer" and
+          rendered every failure in amber. The data is genuinely valuable - it
+          is the ingestion backlog - but framed as a list of losses it reads as
+          something broken, and a dashboard that opens on a red column trains
+          people not to look at it. Same data, shown as demand: what the archive
+          already answers well, and what people are asking for next.
+        */}
         <div className="lg:col-span-2 bg-white dark:bg-slate-800 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-700 p-6">
-          <h3 className="text-base font-bold text-slate-900 dark:text-white mb-1 flex items-center gap-2">
-            <HelpCircle size={17} className="text-amber-500" /> What the archive could not answer
-          </h3>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mb-5">
-            Each of these is a document worth ingesting.
-          </p>
+          <div className="flex items-start justify-between gap-4 mb-5">
+            <div>
+              <h3 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                <Sparkles size={17} className="text-sky-500" /> Archive coverage
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                {coverage?.answered
+                  ? `${coverage.answered} questions answered from your documents${
+                      coverage.answered_this_week
+                        ? ` · ${coverage.answered_this_week} this week`
+                        : ''
+                    }.`
+                  : 'Answers appear here as people start asking questions.'}
+              </p>
+            </div>
+            <CoverageRing value={coverage?.coverage_score} />
+          </div>
+
           {loading ? (
             <Spinner size={20} className="text-sky-500" />
-          ) : unanswered.length === 0 ? (
-            <div className="flex items-center gap-2 text-sm text-emerald-600 dark:text-emerald-400 py-6">
-              <CheckCircle2 size={18} /> Every question so far found supporting passages.
+          ) : !coverage?.requested_topics?.length ? (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 size={18} /> Every question so far found supporting passages.
+              </div>
+              {coverage?.well_covered?.length > 0 && (
+                <div className="flex flex-wrap gap-2 pt-1">
+                  {coverage.well_covered.map((d) => (
+                    <span
+                      key={d.filename}
+                      className="text-xs bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 px-2.5 py-1 rounded-lg"
+                    >
+                      {d.filename} <span className="opacity-60">· {d.answered} answers</span>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
-            <div className="space-y-2">
-              {unanswered.map((q, i) => (
-                <div
-                  key={i}
-                  className="flex items-start justify-between gap-4 p-3 rounded-xl bg-amber-50/60 dark:bg-amber-900/10 border border-amber-100 dark:border-amber-900/40"
-                >
-                  <p className="text-sm text-slate-700 dark:text-slate-300 leading-snug">
-                    {q.question}
-                  </p>
-                  <span className="text-[10px] font-mono text-amber-600 dark:text-amber-400 shrink-0 mt-0.5">
-                    {q.best_score}
-                  </span>
-                </div>
-              ))}
-            </div>
+            <>
+              <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider mb-2.5">
+                Most requested next
+              </p>
+              <div className="space-y-2">
+                {coverage.requested_topics.map((topic, i) => (
+                  <div
+                    key={i}
+                    className="flex items-center justify-between gap-4 p-3 rounded-xl bg-sky-50/60 dark:bg-sky-900/10 border border-sky-100 dark:border-sky-900/40"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-slate-800 dark:text-slate-200 leading-snug truncate">
+                        {topic.topic}
+                      </p>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        asked {topic.asks} time{topic.asks === 1 ? '' : 's'}
+                      </p>
+                    </div>
+                    <span className="text-[10px] font-semibold text-sky-600 dark:text-sky-400 bg-white dark:bg-slate-800 border border-sky-200 dark:border-sky-800 px-2 py-1 rounded-md shrink-0">
+                      add a document
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <p className="text-[11px] text-slate-400 mt-3 leading-relaxed">
+                Each of these is a citizen telling you which document to add next.
+              </p>
+            </>
           )}
         </div>
 
@@ -640,7 +868,7 @@ export const UploadScreen = ({ documents, onUploadSuccess }) => {
  * The capability this architecture makes possible that a plain chat-with-PDF
  * tool cannot do. Overlapping government schemes are exactly the case it serves.
  */
-export const CompareScreen = ({ documents }) => {
+export const CompareScreen = ({ documents, darkMode }) => {
   const [selected, setSelected] = useState([]);
   const [focus, setFocus] = useState('');
   const [result, setResult] = useState(null);
@@ -721,8 +949,14 @@ export const CompareScreen = ({ documents }) => {
       )}
 
       {result && (
-        <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-8 shadow-sm prose prose-slate dark:prose-invert prose-sm max-w-none">
-          <ReactMarkdown components={{ code: CodeBlock }}>{result.comparison}</ReactMarkdown>
+        <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-8 shadow-sm">
+          {/*
+            Rendered through Answer, not raw ReactMarkdown. That is the fix for
+            the side-by-side table arriving as one long line of pipe characters:
+            CommonMark has no tables, so without remark-gfm every row was parsed
+            as ordinary prose and reflowed.
+          */}
+          <Answer content={result.comparison} citations={result.citations} darkMode={darkMode} />
           <Citations citations={result.citations} />
         </div>
       )}
@@ -787,16 +1021,43 @@ export const UsersScreen = ({ currentUsername }) => {
             >
               <div className="flex items-center gap-3 min-w-0">
                 <div className="w-9 h-9 rounded-full bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300 flex items-center justify-center font-bold uppercase text-sm shrink-0">
-                  {user.username.charAt(0)}
+                  {(user.full_name || user.username).charAt(0)}
                 </div>
                 <div className="min-w-0">
                   <p className="font-medium text-slate-900 dark:text-white text-sm truncate">
-                    {user.username}
+                    {user.full_name || user.username}
+                    {user.full_name && (
+                      <span className="text-xs text-slate-400 font-normal ml-1.5">
+                        @{user.username}
+                      </span>
+                    )}
                     {user.username === currentUsername && (
                       <span className="text-xs text-slate-400 font-normal ml-2">you</span>
                     )}
+                    {/*
+                      The pending badge is the whole reason the sign-up form can
+                      offer "Government official" safely: the request is recorded
+                      and surfaced here for a human decision, never auto-granted.
+                    */}
+                    {user.requested_role === 'admin' && (
+                      <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-semibold bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800 px-1.5 py-0.5 rounded">
+                        <ShieldCheck size={10} /> requested official access
+                      </span>
+                    )}
                   </p>
-                  <p className="text-xs text-slate-400">{user.documents} documents ingested</p>
+                  <p className="text-xs text-slate-400 truncate flex items-center gap-1.5">
+                    {user.organisation && (
+                      <>
+                        <Building2 size={11} className="shrink-0" />
+                        <span className="truncate">
+                          {user.designation ? `${user.designation}, ` : ''}
+                          {user.organisation}
+                        </span>
+                        <span className="text-slate-300 dark:text-slate-600">·</span>
+                      </>
+                    )}
+                    <span className="shrink-0">{user.documents} documents ingested</span>
+                  </p>
                 </div>
               </div>
               <select
