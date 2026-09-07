@@ -16,5 +16,8 @@ module.exports = {
       'warn',
       { allowConstantExport: true },
     ],
+    // This codebase does not use PropTypes anywhere; the rule would flag every
+    // destructured prop in every component without adding any safety.
+    'react/prop-types': 'off',
   },
 }
