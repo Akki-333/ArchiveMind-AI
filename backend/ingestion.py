@@ -1,165 +1,342 @@
-import io
-import uuid
-import time
-import json
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from auth import get_current_user
-import PyPDF2
-import docx
-from pptx import Presentation
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_pinecone import PineconeVectorStore
-from database import pc, index_name, get_embeddings, llm, neo4j_driver
+"""Document ingestion: parse, chunk, embed, index, profile.
 
+Three changes matter here beyond the obvious cleanup:
+
+* The route is a plain `def`, not `async def`. Everything it does - PDF
+  parsing, embedding, the Neo4j driver, the LLM call - is synchronous and
+  slow. On the event loop that froze every other request in the process for
+  the duration of an upload. As a sync route FastAPI runs it in a threadpool
+  and concurrency is restored.
+* Chunks are stored in Neo4j as well as Pinecone. That gives us lexical search,
+  citation provenance, and a way to delete vectors by explicit ID rather than
+  relying on metadata-filtered deletion that not every Pinecone tier supports.
+* Page numbers survive chunking, so an answer can cite "p. 12" instead of
+  gesturing vaguely at a filename.
+"""
+import io
+import json
+import logging
+import time
+import uuid
+from typing import List, Tuple
+
+import docx
+import PyPDF2
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from langchain_core.documents import Document
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_pinecone import PineconeVectorStore
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pptx import Presentation
+
+import config
+import graph_store
+from auth import CurrentUser, require_admin
+from database import get_embeddings, index_name, neo4j_driver
+from llm import fast_llm, smart_llm
+
+logger = logging.getLogger("archivemind.ingestion")
 router = APIRouter()
 
-# Graph Extraction Chain (Same as PoC but tailored for real DB)
+# --- Extraction chain --------------------------------------------------------
 parser = JsonOutputParser()
 extraction_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are an AI extracting entities and relationships from documents.\n"
-               "Extract the main entities (such as concepts, technologies, frameworks, methods, organizations, or metrics) and how they relate.\n"
-               "CRITICAL: You MUST ONLY extract entities and relationships that are explicitly mentioned in the provided text AND are relevant to the user's query.\n"
-               "If the user's query is generic (e.g. 'hii', 'hello') or the text does not contain any clear entities relevant to the query, you MUST return empty lists.\n"
-               "Return ONLY a valid JSON object with a 'nodes' list and an 'edges' list.\n"
-               "Format:\n"
-               "{{\n"
-               "  \"nodes\": [ {{\"id\": \"Entity Name\", \"type\": \"Category\"}}, ...],\n"
-               "  \"edges\": [ {{\"source\": \"Entity Name 1\", \"target\": \"Entity Name 2\", \"label\": \"relationship_type\"}}, ...]\n"
-               "}}\n\n"
-               "{format_instructions}"),
-    ("human", "User Query: {query}\n\nExtract relevant entities from the following text:\n\n{text}")
+    ("system",
+     "You extract a knowledge graph from government policy documents.\n"
+     "Identify the entities the user's question is actually about - schemes, "
+     "articles, clauses, organisations, eligibility criteria, benefits, "
+     "obligations, amounts, dates - and how they relate.\n\n"
+     "RULES:\n"
+     "1. Only extract entities that appear explicitly in the provided text.\n"
+     "2. Only extract what is relevant to the user's question.\n"
+     "3. Entity names must be short noun phrases, at most six words. Never put "
+     "a whole sentence in a node.\n"
+     "4. Relationship labels must be two or three words in lower snake_case, "
+     "for example 'provides_benefit' or 'requires'.\n"
+     "5. Give every entity a `type` from: Scheme, Provision, Organisation, "
+     "Person, Beneficiary, Benefit, Requirement, Amount, Date, Location, Concept.\n"
+     "6. Prefer a connected graph: relate new entities back to the main subject "
+     "rather than leaving isolated nodes.\n"
+     "7. If the question is a greeting or the text has no relevant entities, "
+     "return empty lists.\n\n"
+     "Return ONLY valid JSON:\n"
+     "{{\"nodes\": [{{\"id\": \"Entity Name\", \"type\": \"Category\"}}], "
+     "\"edges\": [{{\"source\": \"A\", \"target\": \"B\", \"label\": \"relation\"}}]}}\n\n"
+     "{format_instructions}"),
+    ("human", "Question: {query}\n\nText:\n\n{text}"),
 ])
-extraction_chain = extraction_prompt | llm | parser
+extraction_chain = extraction_prompt | smart_llm | parser
 
-# Overview Profile Chain
+# --- Overview chain ----------------------------------------------------------
 overview_parser = JsonOutputParser()
 overview_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are an AI generating an overview for a government document.\n"
-               "Read the provided text (the first few pages) and return ONLY a valid JSON object with a 'summary' string (max 3 sentences) and a 'key_entities' list of strings.\n"
-               "Format:\n"
-               "{{\n"
-               "  \"summary\": \"Brief summary here...\",\n"
-               "  \"key_entities\": [\"Entity1\", \"Entity2\"]\n"
-               "}}\n\n"
-               "{format_instructions}"),
-    ("human", "Extract from the following text:\n\n{text}")
+    ("system",
+     "You profile a government policy document for a research archive.\n"
+     "Return ONLY valid JSON with:\n"
+     "  summary       - 2 to 3 sentences describing what this document does and "
+     "who it affects. Concrete, no filler.\n"
+     "  key_entities  - 5 to 10 specific names: schemes, bodies, provisions. "
+     "Never generic words like 'document' or 'data'.\n"
+     "  document_type - one of: Act, Rule, Scheme, Circular, Report, "
+     "Guideline, Budget, Other.\n\n"
+     "{format_instructions}"),
+    ("human", "Document opening:\n\n{text}"),
 ])
-overview_chain = overview_prompt | llm | overview_parser
+overview_chain = overview_prompt | fast_llm | overview_parser
 
-def save_to_neo4j(nodes, edges, doc_id):
-    """Pushes extracted nodes and edges into the Neo4j AuraDB."""
+
+# --- Text extraction ---------------------------------------------------------
+def _extract_pages(contents: bytes, ext: str) -> List[Tuple[int, str]]:
+    """Return [(page_number, text)] so page numbers survive into citations."""
+    pages: List[Tuple[int, str]] = []
+
+    if ext == "pdf":
+        reader = PyPDF2.PdfReader(io.BytesIO(contents))
+        for number, page in enumerate(reader.pages, start=1):
+            try:
+                text = page.extract_text() or ""
+            except Exception as exc:
+                logger.warning("Page %d could not be read: %s", number, exc)
+                text = ""
+            if text.strip():
+                pages.append((number, text))
+
+    elif ext == "docx":
+        document = docx.Document(io.BytesIO(contents))
+        paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    paragraphs.append(" | ".join(cells))
+        if paragraphs:
+            pages.append((1, "\n".join(paragraphs)))
+
+    elif ext == "pptx":
+        presentation = Presentation(io.BytesIO(contents))
+        for number, slide in enumerate(presentation.slides, start=1):
+            parts = [
+                shape.text for shape in slide.shapes
+                if hasattr(shape, "text") and shape.text.strip()
+            ]
+            if parts:
+                pages.append((number, "\n".join(parts)))
+
+    else:  # txt, md, csv
+        text = contents.decode("utf-8", errors="ignore")
+        if text.strip():
+            pages.append((1, text))
+
+    return pages
+
+
+# Policy documents have real structure. Splitting on it keeps clauses intact
+# instead of cutting a sentence in half at an arbitrary character count.
+_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=config.CHUNK_SIZE,
+    chunk_overlap=config.CHUNK_OVERLAP,
+    separators=[
+        "\n\nCHAPTER ", "\n\nChapter ",
+        "\n\nPART ", "\n\nPart ",
+        "\n\nSECTION ", "\n\nSection ",
+        "\n\nARTICLE ", "\n\nArticle ",
+        "\n\nClause ", "\n\nSchedule ",
+        "\n\n", "\n", ". ", " ", "",
+    ],
+    length_function=len,
+)
+
+
+def _chunk_pages(pages: List[Tuple[int, str]], doc_id: str, filename: str) -> List[dict]:
+    """Chunk within each page so every chunk keeps a real page number."""
+    chunks: List[dict] = []
+    index = 0
+    for page_number, page_text in pages:
+        for piece in _SPLITTER.split_text(page_text):
+            cleaned = piece.strip()
+            if len(cleaned) < 40:  # headers, page numbers, stray fragments
+                continue
+            chunks.append({
+                "id": f"{doc_id}:{index}",
+                "text": cleaned,
+                "page": page_number,
+                "index": index,
+                "source": filename,
+                "doc_id": doc_id,
+            })
+            index += 1
+    return chunks
+
+
+# --- Persistence -------------------------------------------------------------
+def _store_chunks_in_neo4j(chunks: List[dict], doc_id: str) -> None:
+    """Chunks live in Neo4j too: lexical search, provenance, reliable delete."""
     with neo4j_driver.session() as session:
-        for node in nodes:
-            # Merge ensures we don't create duplicates
-            query = (
-                "MATCH (d:Document {id: $doc_id}) "
-                "MERGE (n:Entity {id: $id}) "
-                "SET n.type = $type "
-                "MERGE (n)-[:FOUND_IN]->(d)"
+        for start in range(0, len(chunks), 100):
+            batch = chunks[start:start + 100]
+            session.run(
+                """
+                MATCH (d:Document {id: $doc_id})
+                UNWIND $chunks AS row
+                MERGE (c:Chunk {id: row.id})
+                SET c.text = row.text, c.page = row.page, c.index = row.index,
+                    c.source = row.source, c.doc_id = row.doc_id
+                MERGE (c)-[:PART_OF]->(d)
+                """,
+                doc_id=doc_id, chunks=batch,
             )
-            session.run(query, id=node["id"], type=node.get("type", "Unknown"), doc_id=doc_id)
-            
-        for edge in edges:
-            # Create relationships between existing nodes
-            query = (
-                "MATCH (source:Entity {id: $source_id}) "
-                "MATCH (target:Entity {id: $target_id}) "
-                "MERGE (source)-[r:RELATED_TO {type: $label}]->(target)"
-            )
-            session.run(query, source_id=edge["source"], target_id=edge["target"], label=edge.get("label", "related_to"))
 
+
+def save_to_neo4j(nodes, edges, doc_id, chunk_ids=None):
+    """Kept for backwards compatibility; delegates to the graph store."""
+    return graph_store.save_graph(nodes, edges, doc_id, chunk_ids)
+
+
+# --- Route -------------------------------------------------------------------
 @router.post("/upload")
-async def upload_document(file: UploadFile = File(...), username: str = Depends(get_current_user)):
-    ext = file.filename.split('.')[-1].lower()
-    allowed_exts = ["pdf", "docx", "pptx", "txt", "md", "csv"]
-    if ext not in allowed_exts:
-        raise HTTPException(status_code=400, detail=f"Unsupported file format. Allowed: {', '.join(allowed_exts)}")
+def upload_document(
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(require_admin),
+):
+    """Ingest a document. Administrators only - this writes to a shared archive."""
+    filename = (file.filename or "").strip()
+    if not filename or "." not in filename:
+        raise HTTPException(status_code=400, detail="The file needs a name with an extension.")
 
-    try:
-        # Check upload limit
-        with neo4j_driver.session() as session:
-            count_result = session.run("MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document) RETURN COUNT(d) AS count", username=username)
-            if count_result.single()["count"] >= 5:
-                raise HTTPException(status_code=400, detail="Upload limit reached. You can only upload a maximum of 5 documents.")
-                
-        doc_id = str(uuid.uuid4())
-        ts = int(time.time() * 1000)
-        # 1. Read File
-        contents = await file.read()
-        text = ""
-        
-        if ext == "pdf":
-            pdf_reader = PyPDF2.PdfReader(io.BytesIO(contents))
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-        elif ext == "docx":
-            doc = docx.Document(io.BytesIO(contents))
-            for para in doc.paragraphs:
-                text += para.text + "\n"
-        elif ext == "pptx":
-            prs = Presentation(io.BytesIO(contents))
-            for slide in prs.slides:
-                for shape in slide.shapes:
-                    if hasattr(shape, "text"):
-                        text += shape.text + "\n"
-        elif ext in ["txt", "md", "csv"]:
-            text = contents.decode('utf-8', errors='ignore')
-            
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="Could not extract text from document.")
-
-        # 2. Chunking
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        chunks = text_splitter.split_text(text)
-        
-        # Convert to LangChain Documents, inject doc_id and filename
-        documents = [Document(page_content=c, metadata={"source": file.filename, "doc_id": doc_id}) for c in chunks]
-
-        # 3. Vector Brain: Push to Pinecone
-        PineconeVectorStore.from_documents(
-            documents, 
-            get_embeddings(), 
-            index_name=index_name
+    ext = filename.rsplit(".", 1)[-1].lower()
+    if ext not in config.ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(config.ALLOWED_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format '.{ext}'. Allowed: {allowed}.",
         )
 
-        # Generate Document Overview Profile from first 2 chunks
-        overview_text = "\n".join(chunks[:2])
-        try:
-            overview_result = overview_chain.invoke({
-                "text": overview_text,
-                "format_instructions": overview_parser.get_format_instructions()
+    # Sync route, so read the underlying spooled file directly.
+    contents = file.file.read()
+    if len(contents) > config.MAX_UPLOAD_BYTES:
+        size_mb = len(contents) / 1_048_576
+        raise HTTPException(
+            status_code=413,
+            detail=f"That file is {size_mb:.1f} MB. The limit is {config.MAX_UPLOAD_MB} MB.",
+        )
+    if not contents:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+
+    with neo4j_driver.session() as session:
+        count = session.run(
+            "MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document) "
+            "RETURN count(d) AS n",
+            username=user.username,
+        ).single()
+        if count and count["n"] >= config.MAX_DOCUMENTS_PER_USER:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Upload limit reached ({config.MAX_DOCUMENTS_PER_USER} documents). "
+                       f"Delete one to make room.",
+            )
+
+    doc_id = str(uuid.uuid4())
+    started = time.perf_counter()
+
+    try:
+        pages = _extract_pages(contents, ext)
+    except Exception:
+        logger.exception("Parsing failed for %s", filename)
+        raise HTTPException(
+            status_code=400,
+            detail=f"That {ext.upper()} could not be read. "
+                   f"It may be scanned images or password protected.",
+        )
+
+    if not pages:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable text was found. Scanned PDFs need OCR before upload.",
+        )
+
+    chunks = _chunk_pages(pages, doc_id, filename)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="The document had no substantial text to index.")
+
+    # --- Vector index ---
+    documents = [
+        Document(
+            page_content=c["text"],
+            metadata={
+                "source": filename,
+                "doc_id": doc_id,
+                "page": c["page"],
+                "chunk_index": c["index"],
+                "chunk_id": c["id"],
+            },
+        )
+        for c in chunks
+    ]
+    vector_ids = [c["id"] for c in chunks]
+
+    try:
+        PineconeVectorStore.from_documents(
+            documents,
+            get_embeddings(),
+            index_name=index_name,
+            ids=vector_ids,  # explicit IDs make deletion reliable on every tier
+        )
+    except Exception:
+        logger.exception("Pinecone indexing failed for %s", filename)
+        raise HTTPException(
+            status_code=502,
+            detail="The search index rejected this document. Please try again.",
+        )
+
+    # --- Profile ---
+    overview_text = "\n\n".join(c["text"] for c in chunks[:3])[:6000]
+    summary, key_entities, doc_type = "Summary not available.", "[]", "Other"
+    try:
+        result = overview_chain.invoke({
+            "text": overview_text,
+            "format_instructions": overview_parser.get_format_instructions(),
+        })
+        summary = (result.get("summary") or summary).strip()
+        key_entities = json.dumps(result.get("key_entities") or [])
+        doc_type = (result.get("document_type") or "Other").strip()
+    except Exception as exc:
+        logger.warning("Overview generation failed for %s: %s", filename, exc)
+
+    # --- Document node ---
+    now = int(time.time() * 1000)
+    with neo4j_driver.session() as session:
+        session.run(
+            """
+            MATCH (u:User {username: $username})
+            CREATE (u)-[:UPLOADED]->(d:Document {
+                id: $doc_id, filename: $filename, summary: $summary,
+                key_entities: $key_entities, document_type: $doc_type,
+                created_at: $ts, pages: $pages, chunk_count: $chunk_count,
+                vector_ids: $vector_ids, size_bytes: $size
             })
-            summary = overview_result.get("summary", "Summary not available.")
-            key_entities = json.dumps(overview_result.get("key_entities", []))
-        except Exception as e:
-            print(f"Error extracting overview: {e}")
-            summary = "Failed to generate summary."
-            key_entities = "[]"
-            
-        # Save Document node to Neo4j
-        with neo4j_driver.session() as session:
-            session.run("""
-                MATCH (u:User {username: $username})
-                CREATE (u)-[:UPLOADED]->(d:Document {
-                    id: $doc_id, 
-                    filename: $filename, 
-                    summary: $summary, 
-                    key_entities: $key_entities, 
-                    created_at: $ts
-                })
-            """, username=username, doc_id=doc_id, filename=file.filename, summary=summary, key_entities=key_entities, ts=ts)
+            """,
+            username=user.username, doc_id=doc_id, filename=filename,
+            summary=summary, key_entities=key_entities, doc_type=doc_type,
+            ts=now, pages=len(pages), chunk_count=len(chunks),
+            vector_ids=vector_ids, size=len(contents),
+        )
 
-        # 4. Relational Brain: Graph extraction is now deferred to query time!
-        # We no longer extract the graph during upload, solving rate limits and speed issues.
+    _store_chunks_in_neo4j(chunks, doc_id)
 
-        return {
-            "status": "success", 
-            "message": f"Document '{file.filename}' processed successfully.",
-            "chunks_embedded": len(documents)
-        }
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "Ingested '%s' (%d pages, %d chunks) in %.1fs for %s",
+        filename, len(pages), len(chunks), elapsed, user.username,
+    )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "status": "success",
+        "message": f"'{filename}' indexed: {len(chunks)} passages across {len(pages)} pages.",
+        "doc_id": doc_id,
+        "chunks_embedded": len(chunks),
+        "pages": len(pages),
+        "document_type": doc_type,
+        "summary": summary,
+        "elapsed_seconds": round(elapsed, 1),
+    }
