@@ -140,11 +140,33 @@ Every stage is configurable in `.env`, and the whole thing runs on free tiers.
 git clone https://github.com/Akki-333/ArchiveMind-AI.git
 cd ArchiveMind-AI
 
-cp .env.example .env
-# Fill in .env. At minimum: PINECONE_API_KEY, NEO4J_*, and one LLM key.
-# Generate a signing key:
-python -c "import secrets; print(secrets.token_urlsafe(32))"   # -> JWT_SECRET
 ```
+
+Create a `.env` file in the repository root with at least these:
+
+```ini
+PINECONE_API_KEY=your-pinecone-key
+PINECONE_INDEX_NAME=archivemind-index
+
+NEO4J_URI=neo4j+s://xxxxx.databases.neo4j.io
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-neo4j-password
+
+# At least one of GROQ_API_KEY, GOOGLE_API_KEY, CEREBRAS_API_KEY, OPENROUTER_API_KEY
+GROQ_API_KEY=your-groq-key
+
+# Required in production. Left unset in development, a key is generated once and
+# cached in .jwt_secret.dev (gitignored) so sign-ins survive a restart.
+# Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+JWT_SECRET=
+
+# Optional. Lets a government official claim administrator access at sign-up.
+ADMIN_ACCESS_CODE=
+```
+
+Every variable is listed in [Configuration](#configuration) below.
+
+```bash
 
 ```bash
 # Backend
@@ -207,14 +229,15 @@ effect immediately rather than when a token happens to expire.
 
 ## Configuration
 
-Everything lives in `.env` — see `.env.example` for the annotated list.
+Everything lives in `.env` at the repository root. Only the keys under **Stores**
+and one LLM key are required; every other variable has a working default.
 
 | Group | Notable keys |
 |---|---|
-| Security | `JWT_SECRET` (required in production), `JWT_EXPIRY_HOURS`, `ADMIN_USERNAMES`, `LOGIN_MAX_ATTEMPTS` |
+| Security | `JWT_SECRET` (required in production), `JWT_EXPIRY_HOURS`, `ADMIN_USERNAMES`, `ADMIN_ACCESS_CODE`, `LOGIN_MAX_ATTEMPTS` |
 | Stores | `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`, `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` |
 | LLM | `GROQ_API_KEY`, `GOOGLE_API_KEY`, `CEREBRAS_API_KEY`, `OPENROUTER_API_KEY`, plus a `*_MODEL` for each |
-| Retrieval | `RETRIEVAL_FINAL_K`, `RETRIEVAL_MIN_SCORE`, `MULTI_QUERY_ENABLED`, `LEXICAL_SEARCH_ENABLED` |
+| Retrieval | `RETRIEVAL_FINAL_K`, `RETRIEVAL_BROAD_K`, `RETRIEVAL_MIN_SCORE`, `RETRIEVAL_RELATIVE_FLOOR`, `ABSTAIN_THRESHOLD`, `MULTI_QUERY_ENABLED`, `LEXICAL_SEARCH_ENABLED` |
 | Ingestion | `MAX_UPLOAD_MB`, `MAX_DOCUMENTS_PER_USER`, `CHUNK_SIZE`, `CHUNK_OVERLAP` |
 | Graph | `GRAPH_CACHE_ENABLED`, `GRAPH_NEIGHBOURHOOD_HOPS`, `GRAPH_MAX_NODES` |
 
@@ -300,10 +323,7 @@ ArchiveMind-AI/
 │   ├── components/      shared UI
 │   ├── pages/           screens
 │   └── App.jsx          layout and routing
-├── scripts/             one-off migrations
-├── Dockerfile
-├── .env.example
-└── CLAUDE.md            engineering notes
+└── Dockerfile           container image for Hugging Face Spaces
 ```
 
 ---
