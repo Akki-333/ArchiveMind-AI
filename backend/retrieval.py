@@ -39,6 +39,55 @@ logger = logging.getLogger("archivemind.retrieval")
 
 RRF_K = 60  # standard reciprocal-rank-fusion damping constant
 
+# --- Broad requests ----------------------------------------------------------
+# "Explain everything this document contains" is a perfectly reasonable request
+# that scores terribly against any single chunk: it shares almost no vocabulary
+# with the policy text, so cosine similarity lands near 0.15 and the old
+# absolute floor discarded every passage and reported that nothing was found.
+#
+# The question was never weak - the *metric* was wrong for it. A request about
+# the document as a whole is answered by a wide, evenly spread slice of the
+# document, not by the single most similar paragraph. These are detected and
+# routed down that path instead.
+_BROAD_PATTERNS = re.compile(
+    r"\b("
+    r"summar(?:y|ise|ize|ising|izing)|overview|synopsis|abstract|gist|"
+    r"explain (?:everything|it|this|the (?:whole|entire|full))|"
+    r"tell me (?:about|everything)|walk me through|brief me|"
+    r"key (?:points|takeaways|highlights|findings)|main (?:points|ideas|topics)|"
+    r"whole document|entire document|full document|all the (?:details|contents)|"
+    r"table of contents|what is (?:in|inside) (?:this|the)|"
+    r"what (?:does|do) (?:this|the|it|these) [\w\s]{0,20}?(?:contain|cover|say|include|do)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+# A question that names something specific is not a request about the document
+# as a whole, even when it is phrased like one. "What do these documents say
+# about Article 330?" reads as broad and is not: it has a subject, and the
+# overview path would answer it with an even sample of the document while
+# ignoring the one clause the user actually asked for.
+_SPECIFIC_MARKER = re.compile(
+    r"\d"                                          # any section, year or amount
+    r"|\b(?:about|regarding|under|concerning|on|for)\s+(?:the\s+)?[A-Z]",  # "about Article"
+    re.UNICODE,
+)
+
+
+def is_broad_query(question: str) -> bool:
+    """True when the user is asking about the document rather than a fact in it."""
+    text = question.strip()
+    if not text:
+        return False
+    if _SPECIFIC_MARKER.search(text):
+        return False
+    if _BROAD_PATTERNS.search(text):
+        return True
+    # A very short question with no distinguishing detail is broad by default:
+    # "this document?", "contents". Anything longer states a subject.
+    return len(text.split()) <= 3
+
 
 @dataclass
 class Passage:
@@ -306,6 +355,57 @@ def mmr_select(query: str, passages: List[Passage], k: int, lambda_: float) -> L
 
 
 # --- Orchestration -----------------------------------------------------------
+def document_overview(doc_id: Optional[str], k: int) -> List[Passage]:
+    """An evenly spread slice of one document, in reading order.
+
+    Used for broad requests. Similarity is the wrong tool for "what is in this
+    document"; the right answer is a sample of the document itself, and taking
+    it in document order means the model reads the structure rather than a bag
+    of disconnected fragments.
+    """
+    if not doc_id:
+        return []
+    try:
+        with neo4j_driver.session() as session:
+            records = list(session.run(
+                """
+                MATCH (c:Chunk {doc_id: $doc_id})
+                RETURN c.id AS chunk_id, c.text AS text, c.doc_id AS doc_id,
+                       c.source AS source, c.page AS page, c.index AS chunk_index
+                ORDER BY c.index ASC
+                """,
+                doc_id=doc_id,
+            ))
+    except Exception as exc:
+        logger.info("Overview read unavailable (%s).", type(exc).__name__)
+        return []
+
+    if not records:
+        return []
+
+    # Sample evenly across the document, always keeping the opening chunk,
+    # which is where a policy document states its purpose and scope.
+    step = max(len(records) // k, 1)
+    sampled = records[::step][:k]
+    if records[0] not in sampled:
+        sampled = [records[0]] + sampled[: k - 1]
+
+    return [
+        Passage(
+            chunk_id=r["chunk_id"],
+            text=r["text"] or "",
+            source=r["source"] or "Unknown document",
+            doc_id=r["doc_id"],
+            page=r["page"],
+            chunk_index=r["chunk_index"],
+            score=1.0,  # the document is trivially "about" itself
+            found_by=["overview"],
+        )
+        for r in sampled
+        if r["text"]
+    ]
+
+
 def retrieve(
     question: str,
     doc_id: Optional[str] = None,
@@ -314,7 +414,16 @@ def retrieve(
     condense: bool = True,
 ) -> List[Passage]:
     """Run the full pipeline and return the passages worth showing the model."""
-    final_k = final_k or config.RETRIEVAL_FINAL_K
+    broad = is_broad_query(question)
+    final_k = final_k or (config.RETRIEVAL_BROAD_K if broad else config.RETRIEVAL_FINAL_K)
+
+    # A broad request about one document is answered from the document, not
+    # from whichever paragraph happens to embed nearest a vague sentence.
+    if broad and doc_id:
+        overview = document_overview(doc_id, final_k)
+        if overview:
+            logger.debug("Broad request; returning %d overview passages.", len(overview))
+            return overview
 
     search_query = condense_query(question, history) if condense else question
     variants = expand_query(search_query)
@@ -334,19 +443,35 @@ def retrieve(
     if not result_lists:
         return []
 
+    lexical_ids = {p.chunk_id for p in lexical}
     fused = reciprocal_rank_fusion(result_lists)[: config.RETRIEVAL_CANDIDATES]
     selected = mmr_select(search_query, fused, final_k, config.RETRIEVAL_MMR_LAMBDA)
-    return _apply_relevance_floor(search_query, selected)
+    return _apply_relevance_floor(search_query, selected, lexical_ids, broad=broad)
 
 
-def _apply_relevance_floor(query: str, passages: List[Passage]) -> List[Passage]:
-    """Score against the real query, not the fused rank, and drop the weak ones.
+def _apply_relevance_floor(
+    query: str,
+    passages: List[Passage],
+    lexical_ids: Optional[set] = None,
+    broad: bool = False,
+) -> List[Passage]:
+    """Score against the real query and drop the passages that are genuinely off-topic.
 
-    A uniformly weak result set should return nothing so the prompt's grounding
-    rule can make the model say it does not know.
+    The floor is relative first, absolute second. That ordering matters: an
+    all-MiniLM-L6-v2 cosine has no fixed meaning across queries. A short
+    keyword question scores 0.55 against its own answer; a full-sentence
+    question about the same passage scores 0.25. Judging both against one
+    absolute number threw away correct answers for the second kind and told
+    the user nothing had been found - which is what made ordinary questions
+    fail. Comparing each passage to the *best* passage for its own query is
+    scale-free and does not have that failure mode.
+
+    The absolute floor stays as a backstop so an entirely unrelated question
+    still finds nothing and the abstain path can do its job.
     """
     if not passages:
         return []
+    lexical_ids = lexical_ids or set()
     try:
         embedder = get_embeddings()
         query_vec = np.asarray(embedder.embed_query(query), dtype=np.float32)
@@ -359,18 +484,31 @@ def _apply_relevance_floor(query: str, passages: List[Passage]) -> List[Passage]
     except Exception:
         return passages
 
-    kept = []
     for passage, similarity in zip(passages, similarities):
         passage.score = float(similarity)
-        if similarity >= config.RETRIEVAL_MIN_SCORE:
-            kept.append(passage)
 
-    # Never return empty purely because the floor was strict: keep the single
-    # best passage if it is close, and let the prompt decide.
-    if not kept and passages:
-        best = max(passages, key=lambda p: p.score)
-        if best.score >= config.RETRIEVAL_MIN_SCORE * 0.6:
-            kept = [best]
+    if broad:
+        return passages
+
+    best = max(p.score for p in passages)
+    relative_cut = best * config.RETRIEVAL_RELATIVE_FLOOR
+
+    kept = [
+        p for p in passages
+        # An exact-term hit is kept regardless of its cosine. A section number
+        # or a scheme name matching verbatim is stronger evidence than an
+        # embedding of it, and a 384-dimensional vector under-rates both.
+        if p.chunk_id in lexical_ids
+        or (p.score >= relative_cut and p.score >= config.RETRIEVAL_MIN_SCORE)
+    ]
+
+    # Never return empty purely because the floor was strict: the best passage
+    # survives whenever it clears the absolute floor at all, and the prompt's
+    # grounding rules decide whether it actually answers the question.
+    if not kept:
+        top = max(passages, key=lambda p: p.score)
+        if top.score >= config.RETRIEVAL_MIN_SCORE:
+            kept = [top]
     return kept
 
 
