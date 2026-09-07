@@ -1,18 +1,41 @@
-fastapi>=0.103.0
-uvicorn>=0.23.2
+# --- Web framework ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+pydantic>=2.6.0
 python-dotenv>=1.0.0
-pydantic>=2.3.0
-langchain>=0.0.300
-langchain-groq>=0.0.1
-langchain-pinecone>=0.0.3
-pinecone-client>=3.0.0
-neo4j>=5.12.0
-python-multipart>=0.0.6
-sentence-transformers>=2.2.2
-PyPDF2>=3.0.0
-python-docx>=1.0.0
-python-pptx>=0.6.22
-bcrypt>=4.0.0
+
+# --- Auth ---
+bcrypt>=4.1.0
 PyJWT>=2.8.0
 
-langchain-community>=0.0.10
+# --- LangChain core ---
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-text-splitters>=0.2.0
+
+# --- Embeddings (local, free, 384-dim) ---
+langchain-huggingface>=0.0.3
+sentence-transformers>=2.7.0
+
+# --- Stores ---
+langchain-pinecone>=0.1.0
+pinecone>=5.0.0
+neo4j>=5.20.0
+
+# --- LLM providers. Groq is the primary; the rest form the fallback chain.
+# Any of them may be omitted - llm.py skips a provider whose package or key
+# is missing rather than failing to start.
+langchain-groq>=0.1.5
+langchain-google-genai>=1.0.0
+langchain-openai>=0.1.7
+# langchain-cerebras>=0.1.0
+
+# --- Document parsing ---
+pypdf>=4.2.0
+PyPDF2>=3.0.1
+python-docx>=1.1.0
+python-pptx>=0.6.23
+
+# --- Numerics (MMR, relevance scoring) ---
+numpy>=1.26.0
