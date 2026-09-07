@@ -22,10 +22,25 @@
 export const NODE_WIDTH = 190;
 export const NODE_HEIGHT = 58;
 
-const COLUMN_GAP = 30;
-const ROW_GAP = 24;
-const LEVEL_GAP = 88;
+const COLUMN_GAP = 34;
+const ROW_GAP = 30;
+// Generous, because this is the band every edge and every edge label has to
+// cross. The old 88px left roughly 30px of clear space between two rows of
+// nodes, which four parallel labels then had to share - so they overlapped.
+const LEVEL_GAP = 130;
 const MAX_PER_ROW = 4;
+
+// A node whose label wraps to a second line is taller than NODE_HEIGHT. Laying
+// every row out on a fixed pitch therefore let tall nodes grow into the row
+// beneath them. Row height is now measured from the tallest node in the row.
+const CHARS_PER_LINE = 22;
+const LINE_HEIGHT = 17;
+const NODE_CHROME = 30; // type label + vertical padding
+
+function estimateNodeHeight(label = '') {
+  const lines = Math.min(Math.ceil(String(label).length / CHARS_PER_LINE) || 1, 2);
+  return Math.max(NODE_HEIGHT, NODE_CHROME + lines * LINE_HEIGHT);
+}
 
 /**
  * Entity palette, keyed to the vocabulary the extraction prompt emits.
@@ -65,71 +80,113 @@ export function legendFor(nodes) {
 }
 
 /**
- * Layered layout with row wrapping.
+ * Layered layout with row wrapping, crossing reduction and measured row heights.
  *
- * Returns nodes with `position` set plus the overall bounds, so the caller can
- * decide whether the graph fits without shrinking the text.
+ * Three changes over the first version, each fixing one cause of the overlap
+ * that could still appear on a rebuilt graph:
+ *
+ * 1. **Longest-path layering, not breadth-first.** BFS assigns a node the
+ *    depth of the *first* parent that reaches it. If "Article 46" is reached
+ *    from a root at depth 1 and also from a depth-1 sibling, BFS still puts it
+ *    at depth 1 - beside its own parent - so the edge between them ran
+ *    sideways straight through the row. Longest-path layering places every
+ *    node strictly below every one of its parents, so no edge is ever
+ *    horizontal and none can pass through a node box on its own level.
+ *
+ * 2. **Barycentre ordering.** Within a level, nodes are reordered towards the
+ *    average position of their neighbours on the level above, swept forwards
+ *    and backwards a few times. This is the standard Sugiyama heuristic and it
+ *    is what stops four edges fanning across each other - in the reported
+ *    screenshot, four "contains provision" edges crossing and stacking their
+ *    labels in the same 30px band.
+ *
+ * 3. **Measured row heights.** A two-line label makes a node taller than
+ *    NODE_HEIGHT; a fixed row pitch let it grow into the row below.
+ *
+ * Returns nodes with `position` and `height` set, plus the overall bounds.
  */
 export function layoutGraph(nodes, edges) {
   if (!nodes.length) return { nodes: [], width: 0, height: 0 };
 
   const ids = new Set(nodes.map((n) => n.id));
   const children = new Map();
-  const inDegree = new Map();
+  const parents = new Map();
   nodes.forEach((n) => {
     children.set(n.id, []);
-    inDegree.set(n.id, 0);
+    parents.set(n.id, []);
   });
-  edges.forEach((e) => {
-    if (!ids.has(e.source) || !ids.has(e.target) || e.source === e.target) return;
+
+  const realEdges = edges.filter(
+    (e) => ids.has(e.source) && ids.has(e.target) && e.source !== e.target,
+  );
+  realEdges.forEach((e) => {
     children.get(e.source).push(e.target);
-    inDegree.set(e.target, inDegree.get(e.target) + 1);
+    parents.get(e.target).push(e.source);
   });
 
-  // Roots are nodes nothing points at. A fully cyclic graph has none, so fall
-  // back to the most connected node rather than returning an empty layout.
-  let roots = nodes.filter((n) => inDegree.get(n.id) === 0).map((n) => n.id);
-  if (!roots.length) {
-    const busiest = [...nodes].sort(
-      (a, b) => (children.get(b.id)?.length || 0) - (children.get(a.id)?.length || 0),
-    )[0];
-    roots = [busiest.id];
-  }
-
-  // Breadth-first depth assignment.
+  // --- 1. Longest-path layering -------------------------------------------
+  // depth(n) = 1 + max(depth(parent)). Cycles are broken by the visiting set,
+  // so a cyclic graph degrades to a sensible layering instead of hanging.
   const depth = new Map();
-  const queue = [];
-  roots.forEach((id) => {
-    depth.set(id, 0);
-    queue.push(id);
-  });
-  while (queue.length) {
-    const id = queue.shift();
-    const d = depth.get(id);
-    for (const child of children.get(id) || []) {
-      if (!depth.has(child)) {
-        depth.set(child, d + 1);
-        queue.push(child);
-      }
-    }
-  }
-  // Anything unreachable sits on its own final level rather than at the origin.
-  const maxDepth = depth.size ? Math.max(...depth.values()) : 0;
-  nodes.forEach((n) => {
-    if (!depth.has(n.id)) depth.set(n.id, maxDepth + 1);
-  });
+  const visiting = new Set();
 
-  // Group by level, keeping siblings adjacent so edges stay short.
+  const resolveDepth = (id) => {
+    if (depth.has(id)) return depth.get(id);
+    if (visiting.has(id)) return 0; // cycle: treat this arc as a back edge
+    visiting.add(id);
+    let best = 0;
+    for (const parent of parents.get(id) || []) {
+      best = Math.max(best, resolveDepth(parent) + 1);
+    }
+    visiting.delete(id);
+    depth.set(id, best);
+    return best;
+  };
+  nodes.forEach((n) => resolveDepth(n.id));
+
+  // --- 2. Group into levels, then reduce crossings -------------------------
   const levels = new Map();
   nodes.forEach((n) => {
-    const d = depth.get(n.id);
+    const d = depth.get(n.id) || 0;
     if (!levels.has(d)) levels.set(d, []);
     levels.get(d).push(n.id);
   });
 
   const orderedDepths = [...levels.keys()].sort((a, b) => a - b);
+  const order = new Map(); // id -> index within its level
+  orderedDepths.forEach((d) => {
+    levels.get(d).forEach((id, i) => order.set(id, i));
+  });
 
-  // First pass: how wide does the widest level get?
+  const barycentre = (id, neighbourIds) => {
+    const known = neighbourIds.filter((n) => order.has(n)).map((n) => order.get(n));
+    // A node with no neighbours on the reference level keeps its place rather
+    // than collapsing to zero and jumping to the far left.
+    return known.length
+      ? known.reduce((a, b) => a + b, 0) / known.length
+      : order.get(id) ?? 0;
+  };
+
+  const sweep = (depths, neighboursOf) => {
+    depths.forEach((d) => {
+      const level = levels.get(d);
+      const scored = level.map((id) => ({ id, key: barycentre(id, neighboursOf(id)) }));
+      // Stable within equal barycentres, so siblings stay adjacent.
+      scored.sort((a, b) => a.key - b.key || order.get(a.id) - order.get(b.id));
+      const reordered = scored.map((s) => s.id);
+      levels.set(d, reordered);
+      reordered.forEach((id, i) => order.set(id, i));
+    });
+  };
+
+  for (let pass = 0; pass < 4; pass += 1) {
+    sweep(orderedDepths.slice(1), (id) => parents.get(id) || []);
+    sweep([...orderedDepths].reverse().slice(1), (id) => children.get(id) || []);
+  }
+
+  // --- 3. Wrap wide levels into a grid and place ---------------------------
+  const heights = new Map(nodes.map((n) => [n.id, estimateNodeHeight(n.data?.label || n.id)]));
+
   let widest = 0;
   const plan = orderedDepths.map((d) => {
     const levelIds = levels.get(d);
@@ -142,20 +199,17 @@ export function layoutGraph(nodes, edges) {
     return { rows };
   });
 
-  // Second pass: place, centring every row inside the widest level.
   const positions = new Map();
   let y = 0;
   plan.forEach(({ rows }, levelIndex) => {
     rows.forEach((row) => {
       const rowWidth = row.length * NODE_WIDTH + (row.length - 1) * COLUMN_GAP;
       const startX = (widest - rowWidth) / 2;
+      const rowHeight = Math.max(...row.map((id) => heights.get(id) || NODE_HEIGHT));
       row.forEach((id, columnIndex) => {
-        positions.set(id, {
-          x: startX + columnIndex * (NODE_WIDTH + COLUMN_GAP),
-          y,
-        });
+        positions.set(id, { x: startX + columnIndex * (NODE_WIDTH + COLUMN_GAP), y });
       });
-      y += NODE_HEIGHT + ROW_GAP;
+      y += rowHeight + ROW_GAP;
     });
     if (levelIndex < plan.length - 1) y += LEVEL_GAP - ROW_GAP;
   });
@@ -167,6 +221,7 @@ export function layoutGraph(nodes, edges) {
       targetPosition: 'top',
       sourcePosition: 'bottom',
     })),
+    depths: depth,
     width: widest,
     height: Math.max(0, y - ROW_GAP),
   };
@@ -197,18 +252,64 @@ export function buildFlowGraph(rawNodes = [], rawLinks = []) {
     });
   });
 
-  const edges = rawLinks
-    .filter((l) => l && seen.has(l.source) && seen.has(l.target))
-    .map((l, i) => ({
-      id: `e-${l.source}-${l.target}-${i}`,
-      source: l.source,
-      target: l.target,
-      label: l.label || 'related to',
-      data: { weight: l.weight || 1 },
-    }));
+  // De-duplicate: the same relationship arriving twice drew two identical
+  // edges and two identical labels exactly on top of each other, which read as
+  // a smeared, bolder label rather than as a duplicate.
+  const edgeSeen = new Set();
+  const edges = [];
+  rawLinks
+    .filter((l) => l && seen.has(l.source) && seen.has(l.target) && l.source !== l.target)
+    .forEach((l, i) => {
+      const label = l.label || 'related to';
+      const key = `${l.source}->${l.target}:${label}`;
+      if (edgeSeen.has(key)) return;
+      edgeSeen.add(key);
+      edges.push({
+        id: `e-${l.source}-${l.target}-${i}`,
+        source: l.source,
+        target: l.target,
+        label,
+        data: { weight: l.weight || 1 },
+      });
+    });
 
   const laid = layoutGraph(nodes, edges);
-  return { nodes: laid.nodes, edges, width: laid.width, height: laid.height };
+
+  // Stagger the labels of edges that run through the same horizontal band.
+  //
+  // React Flow puts an edge label at the midpoint of its path. Every edge
+  // crossing from level N to level N+1 has its midpoint at nearly the same y,
+  // so four sibling edges produced four labels stacked in one 30px strip -
+  // exactly the "contains provision" pile-up in the reported screenshot. Each
+  // edge gets a slot index here; the renderer converts it to a vertical offset,
+  // so the labels sit on separate lines instead of on top of one another.
+  const bandCounts = new Map();
+  const positioned = edges.map((edge) => {
+    const from = laid.depths?.get(edge.source) ?? 0;
+    const to = laid.depths?.get(edge.target) ?? 0;
+    const band = `${from}->${to}`;
+    const slot = bandCounts.get(band) || 0;
+    bandCounts.set(band, slot + 1);
+    return { ...edge, data: { ...edge.data, labelSlot: slot, span: Math.abs(to - from) } };
+  });
+
+  // Centre each band's slots around zero so the fan is symmetric.
+  const withOffsets = positioned.map((edge) => {
+    const from = laid.depths?.get(edge.source) ?? 0;
+    const to = laid.depths?.get(edge.target) ?? 0;
+    const total = bandCounts.get(`${from}->${to}`) || 1;
+    return {
+      ...edge,
+      data: { ...edge.data, labelOffset: edge.data.labelSlot - (total - 1) / 2 },
+    };
+  });
+
+  return {
+    nodes: laid.nodes,
+    edges: withOffsets,
+    width: laid.width,
+    height: laid.height,
+  };
 }
 
 // --- Document domains --------------------------------------------------------

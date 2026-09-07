@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Background, Controls, Handle, MarkerType, Position, ReactFlow,
-  ReactFlowProvider, useStore,
+  Background, BaseEdge, Controls, EdgeLabelRenderer, Handle, MarkerType,
+  Position, ReactFlow, ReactFlowProvider, getSmoothStepPath, useReactFlow,
+  useStore,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { toPng } from 'html-to-image';
@@ -73,6 +74,68 @@ const EntityNode = ({ data, selected }) => {
 
 const nodeTypes = { entity: EntityNode };
 
+// --- Edge --------------------------------------------------------------------
+// Height of one staggered label row. Multiplied by the edge's `labelOffset`
+// (computed in lib/graph.js) to spread the labels of every edge crossing the
+// same band onto separate lines.
+const LABEL_ROW = 21;
+
+/**
+ * The fix for labels printing on top of each other.
+ *
+ * React Flow's built-in edge label sits at the midpoint of the path. Every edge
+ * from one level to the next has its midpoint at nearly the same y, so sibling
+ * edges stacked four labels inside one narrow strip and the text became an
+ * unreadable smear. This renders the label itself, displaced vertically by the
+ * slot the layout assigned it, so parallel relationships read as parallel lines
+ * of text. It also draws the label opaque with a border, so where a label does
+ * sit over an edge the edge passes behind it rather than through it.
+ */
+const RelationEdge = ({
+  id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition,
+  label, data, style, markerEnd,
+}) => {
+  const [path, labelX, labelY] = getSmoothStepPath({
+    sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition,
+    borderRadius: 14,
+  });
+
+  const offset = (data?.labelOffset || 0) * LABEL_ROW;
+  const dimmed = data?.dimmed;
+
+  return (
+    <>
+      <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />
+      {data?.showLabel && label && (
+        <EdgeLabelRenderer>
+          <div
+            className="nodrag nopan"
+            style={{
+              position: 'absolute',
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY + offset}px)`,
+              padding: '2px 7px',
+              borderRadius: 5,
+              fontSize: 10.5,
+              fontWeight: 500,
+              lineHeight: 1.3,
+              whiteSpace: 'nowrap',
+              pointerEvents: 'none',
+              opacity: dimmed ? 0.12 : 1,
+              background: data.labelBg,
+              color: data.labelColor,
+              border: `1px solid ${data.labelBorder}`,
+            }}
+          >
+            {String(label).replace(/_/g, ' ')}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
+};
+
+const edgeTypes = { relation: RelationEdge };
+
 // --- Zoom-aware edge labels --------------------------------------------------
 const ZoomWatcher = ({ onZoomChange }) => {
   const zoom = useStore((s) => s.transform[2]);
@@ -82,8 +145,30 @@ const ZoomWatcher = ({ onZoomChange }) => {
   return null;
 };
 
+/**
+ * Re-frame the viewport whenever the graph is rebuilt.
+ *
+ * `fitView` as a prop only fits on first render. Rebuilding or expanding left
+ * the old transform in place, so a larger graph spilled past the edges and
+ * read as nodes piled on top of one another - the same symptom as a genuine
+ * layout collision, from a different cause.
+ */
+const FitOnChange = ({ signature }) => {
+  const { fitView } = useReactFlow();
+  useEffect(() => {
+    if (!signature) return undefined;
+    // Nodes need one paint to report their measured size before fitView can
+    // compute real bounds.
+    const timer = setTimeout(() => fitView(FIT_VIEW_OPTIONS), 60);
+    return () => clearTimeout(timer);
+  }, [signature, fitView]);
+  return null;
+};
+
 // --- Canvas ------------------------------------------------------------------
-const GraphCanvas = ({ nodes, edges, darkMode, onNodeClick, onEdgeClick, onPaneClick }) => {
+const GraphCanvas = ({
+  nodes, edges, darkMode, onNodeClick, onEdgeClick, onPaneClick, fitSignature,
+}) => {
   const [zoom, setZoom] = useState(1);
   const showEdgeLabels = zoom >= EDGE_LABEL_MIN_ZOOM;
 
@@ -99,21 +184,20 @@ const GraphCanvas = ({ nodes, edges, darkMode, onNodeClick, onEdgeClick, onPaneC
     () =>
       edges.map((edge) => ({
         ...edge,
-        type: 'smoothstep',
+        type: 'relation',
         animated: false,
-        label: showEdgeLabels ? String(edge.label).replace(/_/g, ' ') : undefined,
         style: {
           stroke: edge.data?.highlighted ? '#0ea5e9' : edgeColour,
           strokeWidth: edge.data?.highlighted ? 2.4 : 1.6,
           opacity: edge.data?.dimmed ? 0.15 : 1,
         },
-        labelStyle: { fill: darkMode ? '#cbd5e1' : '#475569', fontWeight: 500, fontSize: 11 },
-        labelBgStyle: {
-          fill: darkMode ? '#1e293b' : '#ffffff',
-          stroke: darkMode ? '#334155' : '#e2e8f0',
+        data: {
+          ...edge.data,
+          showLabel: showEdgeLabels,
+          labelBg: darkMode ? '#1e293b' : '#ffffff',
+          labelColor: darkMode ? '#cbd5e1' : '#475569',
+          labelBorder: darkMode ? '#334155' : '#e2e8f0',
         },
-        labelBgPadding: [6, 3],
-        labelBgBorderRadius: 4,
         markerEnd: {
           type: MarkerType.ArrowClosed,
           color: edge.data?.dimmed ? edgeColour : '#0ea5e9',
@@ -129,6 +213,7 @@ const GraphCanvas = ({ nodes, edges, darkMode, onNodeClick, onEdgeClick, onPaneC
       nodes={nodes}
       edges={styledEdges}
       nodeTypes={nodeTypes}
+      edgeTypes={edgeTypes}
       fitView
       fitViewOptions={FIT_VIEW_OPTIONS}
       minZoom={0.3}
@@ -141,6 +226,7 @@ const GraphCanvas = ({ nodes, edges, darkMode, onNodeClick, onEdgeClick, onPaneC
       style={{ background: canvasBg }}
     >
       <ZoomWatcher onZoomChange={setZoom} />
+      <FitOnChange signature={fitSignature} />
       <Background color={dotColour} gap={22} size={1.5} />
       <Controls
         className={darkMode ? '!bg-slate-800 !border-slate-700' : '!bg-white !border-slate-200'}
@@ -172,6 +258,14 @@ const GraphScreenContent = ({ documents, sessions, currentSessionId, darkMode })
 
   const activeDoc = documents.find((d) => d.id === graphDocId);
   const legend = useMemo(() => legendFor(nodes), [nodes]);
+
+  // Changes whenever the graph is genuinely different, which is the cue to
+  // re-frame the viewport. Node count alone is not enough: expanding an entity
+  // can swap nodes without changing the total.
+  const fitSignature = useMemo(
+    () => (nodes.length ? `${nodes.length}:${edges.length}:${nodes[0]?.id || ''}` : ''),
+    [nodes, edges],
+  );
 
   // --- Query history for the sidebar ---
   useEffect(() => {
@@ -546,6 +640,7 @@ const GraphScreenContent = ({ documents, sessions, currentSessionId, darkMode })
               nodes={displayNodes}
               edges={displayEdges}
               darkMode={darkMode}
+              fitSignature={fitSignature}
               onNodeClick={handleNodeClick}
               onEdgeClick={handleEdgeClick}
               onPaneClick={() => {
