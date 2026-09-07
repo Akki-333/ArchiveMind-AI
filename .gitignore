@@ -1,6 +1,14 @@
 # Environment variables (CRITICAL: Never commit this)
 .env
 .env.local
+.env.example
+
+# Development-only JWT signing key, generated on first run when JWT_SECRET is
+# unset. Local to each machine; production sets JWT_SECRET explicitly.
+.jwt_secret.dev
+
+# Engineering notes. Useful locally, not part of the shipped repository.
+CLAUDE.md
 
 # Python
 __pycache__/

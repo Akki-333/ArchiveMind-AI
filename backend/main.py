@@ -40,6 +40,13 @@ import schema        # noqa: E402
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting ArchiveMind AI (%s)", config.ENVIRONMENT)
+
+    # config.py is imported above before basicConfig runs, so anything it logged
+    # at import time would be dropped. It queues its messages instead; this is
+    # where they surface.
+    for notice in config.STARTUP_NOTICES:
+        logger.info(notice)
+
     try:
         report = schema.apply_schema()
         if report["created"]:

@@ -15,6 +15,12 @@ load_dotenv(dotenv_path=_ENV_PATH)
 
 logger = logging.getLogger("archivemind.config")
 
+# This module is imported before main.py calls logging.basicConfig, so anything
+# logged here at import time is emitted against the default root handler and
+# silently dropped below WARNING. Messages worth showing are queued instead and
+# replayed by the lifespan handler once logging is actually configured.
+STARTUP_NOTICES: list = []
+
 
 class ConfigError(RuntimeError):
     """Raised when the process cannot start safely with the current environment."""
@@ -25,7 +31,8 @@ def _require(name: str) -> str:
     if not value:
         raise ConfigError(
             f"Required environment variable '{name}' is not set. "
-            f"Copy .env.example to .env and fill it in."
+            f"Add it to the .env file at the repository root "
+            f"(the Configuration table in README.md lists every variable)."
         )
     return value
 
@@ -63,8 +70,45 @@ LOG_LEVEL = _optional("LOG_LEVEL", "INFO").upper()
 
 # --- Security ----------------------------------------------------------------
 # SEC-2: never fall back to a committed literal. In production the variable is
-# mandatory; in development we generate an ephemeral key so a fresh clone runs,
-# but tokens then die with the process, which is the correct dev behaviour.
+# mandatory and the process refuses to start without it.
+#
+# In development an unset JWT_SECRET used to mint a fresh random key on every
+# boot, which logged a warning and silently signed everyone out on each
+# `--reload`. That is noise, not safety: the risk being guarded against is a
+# predictable key committed to the repository, not a stable key on a developer's
+# own disk. So we generate once and cache it in a gitignored file. The developer
+# stays signed in across restarts, and the secret still never enters git.
+_DEV_SECRET_PATH = Path(__file__).resolve().parent.parent / ".jwt_secret.dev"
+
+
+def _development_jwt_secret() -> str:
+    try:
+        if _DEV_SECRET_PATH.exists():
+            cached = _DEV_SECRET_PATH.read_text(encoding="utf-8").strip()
+            if len(cached) >= 32:
+                STARTUP_NOTICES.append(
+                    f"JWT_SECRET is not set; using the cached development key in "
+                    f"{_DEV_SECRET_PATH.name}. Set JWT_SECRET in .env before deploying."
+                )
+                return cached
+
+        generated = secrets.token_urlsafe(48)
+        _DEV_SECRET_PATH.write_text(generated + "\n", encoding="utf-8")
+        STARTUP_NOTICES.append(
+            f"JWT_SECRET is not set; generated a development key and cached it in "
+            f"{_DEV_SECRET_PATH.name} so sign-ins survive a restart. That file is "
+            f"gitignored. Set JWT_SECRET in .env before deploying."
+        )
+        return generated
+    except OSError as exc:
+        # A read-only checkout is not a reason to refuse to start in dev.
+        STARTUP_NOTICES.append(
+            f"Could not cache a development JWT key ({exc}); using an ephemeral one. "
+            f"Sessions will end when this process restarts."
+        )
+        return secrets.token_urlsafe(48)
+
+
 _jwt_secret = _optional("JWT_SECRET")
 if not _jwt_secret:
     if IS_PRODUCTION:
@@ -72,11 +116,7 @@ if not _jwt_secret:
             "JWT_SECRET must be set in production. "
             "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
         )
-    _jwt_secret = secrets.token_urlsafe(32)
-    logger.warning(
-        "JWT_SECRET is not set. Generated an ephemeral development key - "
-        "all sessions will be invalidated when this process restarts."
-    )
+    _jwt_secret = _development_jwt_secret()
 JWT_SECRET = _jwt_secret
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = _int("JWT_EXPIRY_HOURS", 24)
@@ -85,14 +125,22 @@ MIN_PASSWORD_LENGTH = _int("MIN_PASSWORD_LENGTH", 8)
 LOGIN_MAX_ATTEMPTS = _int("LOGIN_MAX_ATTEMPTS", 8)
 LOGIN_WINDOW_SECONDS = _int("LOGIN_WINDOW_SECONDS", 300)
 
-# SEC-1: roles are never accepted from a client. Admins are named here, or the
-# very first account created on an empty database is bootstrapped as admin.
+# SEC-1: roles are never accepted from a client. Admins are named here, granted
+# a shared access code out of band, or bootstrapped as the very first account on
+# an empty database.
 ADMIN_USERNAMES = {
     u.strip().lower()
     for u in _optional("ADMIN_USERNAMES").split(",")
     if u.strip()
 }
 BOOTSTRAP_FIRST_USER_AS_ADMIN = _flag("BOOTSTRAP_FIRST_USER_AS_ADMIN", True)
+
+# A government official registering on their own needs a way to prove they are
+# one. The sign-up form lets them *request* the role; this code is what the
+# server checks before granting it. Anyone without the code is registered as a
+# reader with a pending request an existing admin can approve. The client still
+# never decides - it asks, and the server rules.
+ADMIN_ACCESS_CODE = _optional("ADMIN_ACCESS_CODE")
 
 # --- CORS --------------------------------------------------------------------
 # "*" with credentials is rejected by browsers, so we resolve it explicitly.
@@ -159,13 +207,30 @@ ALLOWED_EXTENSIONS = {"pdf", "docx", "pptx", "txt", "md", "csv"}
 # --- Retrieval ---------------------------------------------------------------
 # Wide recall then aggressive narrowing. A small embedding model needs the
 # extra candidates; the fusion and MMR stages put precision back.
-RETRIEVAL_CANDIDATES = _int("RETRIEVAL_CANDIDATES", 24)
+RETRIEVAL_CANDIDATES = _int("RETRIEVAL_CANDIDATES", 28)
 RETRIEVAL_FINAL_K = _int("RETRIEVAL_FINAL_K", 6)
-RETRIEVAL_MIN_SCORE = _float("RETRIEVAL_MIN_SCORE", 0.28)
+# A broad request ("summarise this", "what does this cover") deliberately pulls
+# a wider slice, because the answer is the shape of the whole document.
+RETRIEVAL_BROAD_K = _int("RETRIEVAL_BROAD_K", 12)
+
+# The floor is *relative* first and absolute second (see retrieval.py). An
+# all-MiniLM-L6-v2 cosine of 0.28 was far too strict: correct passages for
+# ordinary questions routinely score 0.20-0.30, so real answers were being
+# thrown away and the user was told nothing had been found. The absolute floor
+# now only removes passages that are genuinely unrelated.
+RETRIEVAL_MIN_SCORE = _float("RETRIEVAL_MIN_SCORE", 0.16)
+# Keep anything within this fraction of the best passage, so a strong hit pulls
+# its supporting context in with it.
+RETRIEVAL_RELATIVE_FLOOR = _float("RETRIEVAL_RELATIVE_FLOOR", 0.55)
 RETRIEVAL_MMR_LAMBDA = _float("RETRIEVAL_MMR_LAMBDA", 0.72)
 MULTI_QUERY_ENABLED = _flag("MULTI_QUERY_ENABLED", True)
 MULTI_QUERY_COUNT = _int("MULTI_QUERY_COUNT", 3)
 LEXICAL_SEARCH_ENABLED = _flag("LEXICAL_SEARCH_ENABLED", True)
+
+# Below this the archive says it found nothing rather than answering. Paired
+# with the relative floor above, and overridden entirely for broad requests and
+# for strong exact-term (lexical) matches, which a cosine score under-rates.
+ABSTAIN_THRESHOLD = _float("ABSTAIN_THRESHOLD", 0.20)
 
 # --- Chat --------------------------------------------------------------------
 HISTORY_TURNS = _int("HISTORY_TURNS", 10)
@@ -196,10 +261,14 @@ def summary() -> dict:
         "retrieval": {
             "candidates": RETRIEVAL_CANDIDATES,
             "final_k": RETRIEVAL_FINAL_K,
+            "broad_k": RETRIEVAL_BROAD_K,
             "min_score": RETRIEVAL_MIN_SCORE,
+            "relative_floor": RETRIEVAL_RELATIVE_FLOOR,
+            "abstain_threshold": ABSTAIN_THRESHOLD,
             "multi_query": MULTI_QUERY_ENABLED,
             "lexical": LEXICAL_SEARCH_ENABLED,
         },
+        "admin_access_code_set": bool(ADMIN_ACCESS_CODE),
         "limits": {
             "max_upload_mb": MAX_UPLOAD_MB,
             "max_documents_per_user": MAX_DOCUMENTS_PER_USER,
