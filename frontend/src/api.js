@@ -69,11 +69,21 @@ export function storedSession() {
 export const login = (username, password) =>
   api.post('/api/auth/login', { username, password }).then((r) => r.data);
 
-export const register = (username, password) =>
-  api.post('/api/auth/register', { username, password }).then((r) => r.data);
+/**
+ * `details` carries the profile fields and, for a government official, the
+ * access code. The server decides the role from them - the client is asking,
+ * not granting. See backend/auth.py.
+ */
+export const register = (username, password, details = {}) =>
+  api.post('/api/auth/register', { username, password, ...details }).then((r) => r.data);
 
-/** Server-authoritative identity. Called on every boot. */
+/** Server-authoritative identity, plus the profile. Called on every boot. */
 export const fetchIdentity = () => api.get('/api/auth/me').then((r) => r.data);
+
+export const updateProfile = (profile) => api.put('/api/auth/me', profile).then((r) => r.data);
+
+export const updatePassword = (payload) =>
+  api.put('/api/auth/me/password', payload).then((r) => r.data);
 
 export const fetchUsers = () => api.get('/api/auth/users').then((r) => r.data.users);
 
@@ -125,6 +135,16 @@ export const fetchHistory = (id) =>
 export const sendMessage = (message, sessionId) =>
   api.post('/api/chat', { message, session_id: sessionId }).then((r) => r.data);
 
+/**
+ * Rewrite a question already asked and regenerate from that point.
+ * The server drops that message and everything after it before re-answering,
+ * so the transcript never shows a reply to a question that was never asked.
+ */
+export const editMessage = (messageId, message, sessionId) =>
+  api
+    .post('/api/chat/edit', { message, session_id: sessionId, message_id: messageId })
+    .then((r) => r.data);
+
 export const fetchRecommendations = () =>
   api.get('/api/chat/recommendations').then((r) => r.data.recommendations);
 
@@ -156,5 +176,8 @@ export const fetchUnanswered = (limit = 20) =>
   api.get('/api/analytics/unanswered', { params: { limit } }).then((r) => r.data.questions);
 
 export const fetchAnalytics = () => api.get('/api/analytics/overview').then((r) => r.data);
+
+/** What the archive covers well, and what people are asking it to cover next. */
+export const fetchCoverage = () => api.get('/api/analytics/coverage').then((r) => r.data);
 
 export default api;

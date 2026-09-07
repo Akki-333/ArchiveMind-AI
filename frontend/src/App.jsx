@@ -22,6 +22,7 @@ const App = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [username, setUsername] = useState('');
   const [role, setRole] = useState('user');
+  const [displayName, setDisplayName] = useState('');
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('darkMode') === '1');
   const [showSettings, setShowSettings] = useState(false);
 
@@ -37,6 +38,7 @@ const App = () => {
     setIsAuthenticated(false);
     setUsername('');
     setRole('user');
+    setDisplayName('');
     setSessions([]);
     setCurrentSessionId(null);
     setMessages([]);
@@ -69,6 +71,7 @@ const App = () => {
       .then((identity) => {
         setUsername(identity.username);
         setRole(identity.role);
+        setDisplayName(identity.full_name || '');
         localStorage.setItem('role', identity.role);
         setIsAuthenticated(true);
       })
@@ -135,6 +138,7 @@ const App = () => {
             onClose={() => setShowSettings(false)}
             username={username}
             role={role}
+            onProfileSaved={(profile) => setDisplayName(profile.full_name || '')}
           />
         )}
 
@@ -171,7 +175,7 @@ const App = () => {
               </div>
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                  {username}
+                  {displayName || username}
                 </p>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
                   {isAdmin ? 'Administrator' : 'Reader'}
@@ -233,6 +237,7 @@ const App = () => {
                   messages={messages}
                   setMessages={setMessages}
                   documents={documents}
+                  darkMode={darkMode}
                 />
               }
             />
@@ -247,7 +252,10 @@ const App = () => {
                 />
               }
             />
-            <Route path="/compare" element={<CompareScreen documents={documents} />} />
+            <Route
+              path="/compare"
+              element={<CompareScreen documents={documents} darkMode={darkMode} />}
+            />
             <Route
               path="/upload"
               element={
