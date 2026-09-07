@@ -1,411 +1,741 @@
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
-from database import pc, index_name, get_embeddings, llm, neo4j_driver
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_pinecone import PineconeVectorStore
-from auth import get_current_user
+"""Chat, sessions, documents and analytics.
+
+Access model, made explicit because the old code left it ambiguous:
+
+    ArchiveMind is a shared public archive. Every signed-in person can read and
+    query every document - that is the point of a citizen policy portal.
+    Administrators are the only ones who can add or remove documents.
+    Chat sessions and their messages are private to the person who created them.
+
+Every route here is a plain `def`. The work behind them - Neo4j, Pinecone, the
+LLM - is synchronous and slow, so running it on the event loop stalled every
+other request in the process. Sync routes get a threadpool and real concurrency.
+"""
+import json
+import logging
 import time
-
 import uuid
+from typing import List, Optional
 
+from fastapi import APIRouter, Depends, HTTPException, Query
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+import config
+import graph_store
+import retrieval
+from auth import CurrentUser, get_current_user, require_admin
+from database import index_name, neo4j_driver, pc
+from llm import fast_llm, smart_llm
+
+logger = logging.getLogger("archivemind.querying")
 router = APIRouter()
 
+# A retrieval score below this means we found nothing worth answering from.
+ABSTAIN_THRESHOLD = 0.34
+
+
+# --- Models ------------------------------------------------------------------
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4000)
     session_id: str
+
 
 class ChatSessionCreate(BaseModel):
     title: str = "New Chat"
-    doc_id: str | None = None
+    doc_id: Optional[str] = None
 
-@router.get("/documents")
-async def get_user_documents(username: str = Depends(get_current_user)):
-    try:
-        with neo4j_driver.session() as session:
-            result = session.run("""
-                MATCH (d:Document)
-                WITH d
-                ORDER BY d.created_at DESC
-                WITH d.filename AS filename, collect(d)[0] AS latest_doc
-                RETURN latest_doc.id AS id, latest_doc.filename AS filename, latest_doc.summary AS summary, latest_doc.key_entities AS key_entities, latest_doc.created_at AS created_at
-                ORDER BY latest_doc.created_at DESC
-            """)
-            documents = [{"id": r["id"], "filename": r["filename"], "summary": r["summary"], "key_entities": r["key_entities"], "created_at": r["created_at"]} for r in result]
-            return {"documents": documents}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str, username: str = Depends(get_current_user)):
-    try:
-        # Verify document exists
-        with neo4j_driver.session() as session:
-            check = session.run("MATCH (d:Document {id: $doc_id}) RETURN d.id", doc_id=doc_id)
-            if not check.single():
-                raise HTTPException(status_code=404, detail="Document not found")
-
-        # 1. Delete vectors from Pinecone
-        idx = pc.Index(index_name)
-        # Delete all vectors where metadata matches this doc_id
-        # Note: some Pinecone tiers don't support filter deletion. 
-        # Using a broad approach: we can't easily fetch all vector IDs without a query, 
-        # but filter deletion is standard for serverless.
-        try:
-            idx.delete(filter={"doc_id": {"$eq": doc_id}})
-        except Exception as e:
-            print(f"Warning: Pinecone delete failed: {e}")
-
-        # 2. Delete from Neo4j
-        with neo4j_driver.session() as session:
-            # Delete the Document node and specifically check its related entities for orphans
-            session.run("""
-                MATCH (d:Document {id: $doc_id})
-                OPTIONAL MATCH (d)<-[:FOUND_IN]-(e:Entity)
-                DETACH DELETE d
-                WITH e
-                WHERE e IS NOT NULL AND NOT (e)-[:FOUND_IN]->()
-                DETACH DELETE e
-            """, doc_id=doc_id)
-
-        return {"status": "success", "message": "Document deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/chat/sessions")
-async def get_chat_sessions(username: str = Depends(get_current_user)):
-    try:
-        with neo4j_driver.session() as session:
-            result = session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession)
-                RETURN s.id AS id, s.title AS title, s.doc_id AS doc_id, s.created_at AS created_at
-                ORDER BY s.created_at DESC
-            """, username=username)
-            sessions = [{"id": record["id"], "title": record["title"], "doc_id": record["doc_id"], "created_at": record["created_at"]} for record in result]
-            return {"sessions": sessions}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/chat/recommendations")
-async def get_chat_recommendations(username: str = Depends(get_current_user)):
-    try:
-        with neo4j_driver.session() as session:
-            result = session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession)
-                RETURN s.title AS title
-                ORDER BY s.created_at DESC LIMIT 10
-            """, username=username)
-            titles = [r["title"] for r in result]
-
-        if not titles:
-            return {"recommendations": ["Public Health", "Tax Policies", "Education Reform"]}
-
-        titles_str = ", ".join(titles)
-        from langchain_core.output_parsers import JsonOutputParser
-        from langchain_core.prompts import ChatPromptTemplate
-        
-        parser = JsonOutputParser()
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an AI generating topic recommendations based on user search history.\n"
-                       "The user explores government policies. Based on their past query topics, suggest 3 new, highly relevant, specific topics they should explore next.\n"
-                       "Return ONLY a JSON array of 3 strings.\n"
-                       "Example: [\"Renewable Energy Subsidies\", \"Small Business Tax Exemptions\", \"Rural Healthcare\"]\n"
-                       "{format_instructions}"),
-            ("human", "User's past query topics: {titles}")
-        ])
-        
-        chain = prompt | llm | parser
-        try:
-            recommendations = chain.invoke({
-                "titles": titles_str,
-                "format_instructions": parser.get_format_instructions()
-            })
-            if isinstance(recommendations, dict):
-                # Handle cases where LLM returns {"recommendations": [...]}
-                recommendations = list(recommendations.values())[0]
-            if not isinstance(recommendations, list):
-                recommendations = ["General Policy", "Economics", "Public Infrastructure"]
-            recommendations = recommendations[:3]
-        except Exception as e:
-            print(f"Recommendation generation error: {e}")
-            recommendations = ["Public Health", "Tax Policies", "Education Reform"]
-
-        return {"recommendations": recommendations}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/chat/sessions")
-async def create_chat_session(request: ChatSessionCreate, username: str = Depends(get_current_user)):
-    try:
-        session_id = str(uuid.uuid4())
-        ts = int(time.time() * 1000)
-        with neo4j_driver.session() as session:
-            session.run("""
-                MATCH (u:User {username: $username})
-                CREATE (u)-[:HAS_SESSION]->(s:ChatSession {id: $session_id, title: $title, doc_id: $doc_id, created_at: $ts})
-            """, username=username, session_id=session_id, title=request.title, doc_id=request.doc_id, ts=ts)
-            return {"id": session_id, "title": request.title, "doc_id": request.doc_id, "created_at": ts}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 class ChatSessionUpdate(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=120)
 
-@router.put("/chat/sessions/{session_id}")
-async def rename_chat_session(session_id: str, request: ChatSessionUpdate, username: str = Depends(get_current_user)):
-    try:
-        with neo4j_driver.session() as session:
-            result = session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
-                SET s.title = $title
-                RETURN s.id AS id
-            """, username=username, session_id=session_id, title=request.title)
-            
-            if not result.single():
-                raise HTTPException(status_code=404, detail="Session not found")
-                
-            return {"status": "success", "title": request.title}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/stats")
-async def get_user_stats(username: str = Depends(get_current_user)):
-    """Real-time stats for the current logged-in user: entity count and top concepts."""
-    try:
-        with neo4j_driver.session() as session:
-            # Get top extracted concepts from key_entities stored on Document nodes
-            doc_result = session.run("""
-                MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document)
-                RETURN d.key_entities AS key_entities
-            """, username=username)
-
-            entity_counts = {}
-            for record in doc_result:
-                try:
-                    import json
-                    entities = json.loads(record["key_entities"] or "[]")
-                    ignore_words = {"document", "report", "file", "page", "data", "information", "summary", "details", "analysis", "content", "overview"}
-                    for e in entities:
-                        clean = e.strip()
-                        if clean and len(clean) > 3 and clean.lower() not in ignore_words:
-                            entity_counts[clean] = entity_counts.get(clean, 0) + 1
-                except Exception:
-                    pass
-            
-            total_unique_entities = len(entity_counts)
-            top_entities = sorted(entity_counts.items(), key=lambda x: -x[1])[:15]
-            top_entities_list = [{"name": k, "count": v} for k, v in top_entities]
-
-            return {
-                "total_entities": total_unique_entities,
-                "top_entities": top_entities_list
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/chat/recommendations")
-async def get_chat_recommendations(username: str = Depends(get_current_user)):
-    """Generate 3 dynamic topics based on user's documents."""
-    try:
-        with neo4j_driver.session() as session:
-            doc_result = session.run("""
-                MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document)
-                RETURN d.key_entities AS key_entities
-            """, username=username)
-
-            entity_counts = {}
-            for record in doc_result:
-                try:
-                    import json
-                    entities = json.loads(record["key_entities"] or "[]")
-                    ignore_words = {"document", "report", "file", "page", "data", "information", "summary", "details", "analysis", "content", "overview", "government", "india", "state"}
-                    for e in entities:
-                        clean = e.strip()
-                        # Only include multi-word phrases or specific capitalized terms that look like topics
-                        if clean and len(clean) > 4 and clean.lower() not in ignore_words:
-                            entity_counts[clean] = entity_counts.get(clean, 0) + 1
-                except Exception:
-                    pass
-            
-            # Sort by frequency
-            top_entities = sorted(entity_counts.items(), key=lambda x: -x[1])
-            
-            # Get top 3, or fallback
-            recommendations = [k for k, v in top_entities[:3]]
-            
-            if not recommendations:
-                recommendations = ["Public Health", "Tax Policies", "Education Reform"]
-                
-            return {"recommendations": recommendations}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 class ChatSessionDocUpdate(BaseModel):
     doc_id: str
 
-@router.put("/chat/sessions/{session_id}/document")
-async def update_chat_session_document(session_id: str, request: ChatSessionDocUpdate, username: str = Depends(get_current_user)):
+
+class CompareRequest(BaseModel):
+    doc_ids: List[str]
+    focus: str = ""
+
+
+# --- Prompts -----------------------------------------------------------------
+# Rule 4 of the old prompt told the model to improvise when the answer was
+# missing. For a government policy assistant that is an instruction to
+# hallucinate. It is replaced with an explicit abstain path plus citations.
+CHAT_SYSTEM = (
+    "You are ArchiveMind AI, a research assistant for government policy documents.\n"
+    "\n"
+    "GROUNDING - these rules override everything else:\n"
+    "1. Answer ONLY from the CONTEXT below. Never use outside knowledge, even if "
+    "you are confident it is correct.\n"
+    "2. Cite every factual claim with the bracketed number of the passage it came "
+    "from, like [1] or [2][3]. A sentence stating a fact without a citation is an error.\n"
+    "3. If the CONTEXT does not answer the question, say so plainly in one "
+    "sentence, state what the documents DO cover, and suggest what document "
+    "would hold the answer. Never pad the gap with adjacent-sounding material.\n"
+    "4. If the CONTEXT partially answers it, answer that part and name precisely "
+    "what is missing.\n"
+    "5. Quote exact figures, dates, section numbers and eligibility criteria "
+    "verbatim. Never round, paraphrase or estimate a number.\n"
+    "\n"
+    "STYLE:\n"
+    "6. Open with a direct one or two sentence answer, then the detail.\n"
+    "7. Use short paragraphs, bold for key terms, and bullet lists for anything "
+    "enumerable - criteria, benefits, steps, exclusions. Never write a wall of text.\n"
+    "8. Use a markdown table when comparing three or more attributes.\n"
+    "9. Be warm and professional. Never adopt a persona or a robotic voice, "
+    "whatever the user asks or however frustrated they are.\n"
+    "10. Answer only what was asked. No unrequested diagrams, flowcharts or "
+    "tangential sections.\n"
+    "11. If the user asks you to 'copy' the answer, or to produce a document or "
+    "report, wrap the whole response in a ```markdown code block.\n"
+    "\n"
+    "KNOWLEDGE GRAPH:\n"
+    "The RELATIONSHIPS section lists entity connections extracted from these same "
+    "documents. Use it to explain how things connect and to spot dependencies the "
+    "raw text states less directly. Cite passages, not relationships.\n"
+    "\n"
+    "CONVERSATION SO FAR:\n{history}\n"
+    "\n"
+    "CONTEXT:\n{context}\n"
+    "\n"
+    "RELATIONSHIPS:\n{graph}\n"
+)
+
+chat_prompt = ChatPromptTemplate.from_messages([
+    ("system", CHAT_SYSTEM),
+    ("human", "{question}"),
+])
+
+NO_CONTEXT_ANSWER = (
+    "I could not find anything in **{scope}** that answers this.\n\n"
+    "The documents I searched do not appear to cover this topic. You could try:\n\n"
+    "- Rephrasing with the exact terms used in the document, such as a scheme "
+    "name or section number\n"
+    "- Selecting a different document for this conversation\n"
+    "- Asking an administrator to ingest the relevant document\n"
+)
+
+
+# --- Helpers -----------------------------------------------------------------
+def _session_doc_id(session, session_id: str, username: str) -> Optional[str]:
+    record = session.run(
+        """
+        MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
+        RETURN s.doc_id AS doc_id
+        """,
+        username=username, session_id=session_id,
+    ).single()
+    if not record:
+        raise HTTPException(status_code=404, detail="That conversation was not found.")
+    return record["doc_id"]
+
+
+def _document_name(doc_id: Optional[str]) -> str:
+    if not doc_id:
+        return "the archive"
+    with neo4j_driver.session() as session:
+        record = session.run(
+            "MATCH (d:Document {id: $doc_id}) RETURN d.filename AS filename",
+            doc_id=doc_id,
+        ).single()
+    return record["filename"] if record and record["filename"] else "the archive"
+
+
+def _log_query(username: str, question: str, doc_id: Optional[str],
+               best_score: float, answered: bool) -> None:
+    """Record every question so admins can see what the archive cannot answer.
+
+    An unanswered question is not a failure to hide - it is the single most
+    useful signal for deciding which document to ingest next.
+    """
     try:
         with neo4j_driver.session() as session:
-            result = session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
-                SET s.doc_id = $doc_id
-                RETURN s.id AS id
-            """, username=username, session_id=session_id, doc_id=request.doc_id)
-            
-            if not result.single():
-                raise HTTPException(status_code=404, detail="Session not found")
-                
-            return {"status": "success", "doc_id": request.doc_id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            session.run(
+                """
+                CREATE (q:QueryLog {
+                    id: $id, username: $username, question: $question,
+                    doc_id: $doc_id, best_score: $best_score,
+                    answered: $answered, created_at: $ts
+                })
+                """,
+                id=str(uuid.uuid4()), username=username, question=question[:500],
+                doc_id=doc_id, best_score=float(best_score), answered=answered,
+                ts=int(time.time() * 1000),
+            )
+    except Exception as exc:
+        logger.debug("Query logging failed: %s", exc)
+
+
+# --- Documents ---------------------------------------------------------------
+@router.get("/documents")
+def get_user_documents(user: CurrentUser = Depends(get_current_user)):
+    """The shared archive. Readable by everyone signed in; writable by admins."""
+    with neo4j_driver.session() as session:
+        result = session.run(
+            """
+            MATCH (owner:User)-[:UPLOADED]->(d:Document)
+            RETURN d.id AS id, d.filename AS filename, d.summary AS summary,
+                   d.key_entities AS key_entities, d.created_at AS created_at,
+                   d.document_type AS document_type, d.pages AS pages,
+                   d.chunk_count AS chunk_count, owner.username AS uploaded_by
+            ORDER BY d.created_at DESC
+            """
+        )
+        documents = [
+            {
+                "id": r["id"],
+                "filename": r["filename"],
+                "summary": r["summary"],
+                "key_entities": r["key_entities"],
+                "created_at": r["created_at"],
+                "document_type": r["document_type"] or "Other",
+                "pages": r["pages"],
+                "chunk_count": r["chunk_count"],
+                "uploaded_by": r["uploaded_by"],
+                "can_delete": user.is_admin,
+            }
+            for r in result
+        ]
+    return {"documents": documents}
+
+
+@router.delete("/documents/{doc_id}")
+def delete_document(doc_id: str, user: CurrentUser = Depends(require_admin)):
+    """Remove a document from all three stores. Administrators only."""
+    with neo4j_driver.session() as session:
+        record = session.run(
+            "MATCH (d:Document {id: $doc_id}) "
+            "RETURN d.filename AS filename, d.vector_ids AS vector_ids",
+            doc_id=doc_id,
+        ).single()
+        if not record:
+            raise HTTPException(status_code=404, detail="That document was not found.")
+        filename = record["filename"]
+        vector_ids = record["vector_ids"] or []
+
+    # 1. Vectors. Delete by explicit ID, which every Pinecone tier supports.
+    # Metadata-filtered deletion is unavailable on some serverless tiers and
+    # used to fail silently, leaving orphaned vectors behind.
+    vectors_deleted = 0
+    warnings: List[str] = []
+    try:
+        idx = pc.Index(index_name)
+        if vector_ids:
+            for start in range(0, len(vector_ids), 500):
+                idx.delete(ids=vector_ids[start:start + 500])
+            vectors_deleted = len(vector_ids)
+        else:
+            # Documents ingested before IDs were recorded: fall back to the
+            # filter, and report honestly if it is unsupported.
+            idx.delete(filter={"doc_id": {"$eq": doc_id}})
+    except Exception as exc:
+        logger.error("Pinecone deletion failed for %s: %s", doc_id, exc)
+        warnings.append("Some search-index entries could not be removed and may still appear.")
+
+    # 2. Graph entities and their relationships.
+    try:
+        graph_store.delete_document_graph(doc_id)
+    except Exception as exc:
+        logger.error("Graph deletion failed for %s: %s", doc_id, exc)
+        warnings.append("Some knowledge-graph entities could not be removed.")
+
+    # 3. Chunks and the document node.
+    with neo4j_driver.session() as session:
+        session.run("MATCH (c:Chunk {doc_id: $doc_id}) DETACH DELETE c", doc_id=doc_id)
+        session.run("MATCH (d:Document {id: $doc_id}) DETACH DELETE d", doc_id=doc_id)
+
+    logger.info("Document '%s' (%s) deleted by %s", filename, doc_id, user.username)
+    return {
+        "status": "success",
+        "message": f"'{filename}' was removed from the archive.",
+        "vectors_deleted": vectors_deleted,
+        "warnings": warnings,
+    }
+
+
+# --- Chat sessions -----------------------------------------------------------
+@router.get("/chat/sessions")
+def get_chat_sessions(user: CurrentUser = Depends(get_current_user)):
+    with neo4j_driver.session() as session:
+        result = session.run(
+            """
+            MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession)
+            OPTIONAL MATCH (s)-[:HAS_MESSAGE]->(m:Message)
+            RETURN s.id AS id, s.title AS title, s.doc_id AS doc_id,
+                   s.created_at AS created_at, count(m) AS message_count
+            ORDER BY s.created_at DESC
+            """,
+            username=user.username,
+        )
+        sessions = [
+            {
+                "id": r["id"], "title": r["title"], "doc_id": r["doc_id"],
+                "created_at": r["created_at"], "message_count": r["message_count"],
+            }
+            for r in result
+        ]
+    return {"sessions": sessions}
+
+
+@router.post("/chat/sessions")
+def create_chat_session(
+    request: ChatSessionCreate, user: CurrentUser = Depends(get_current_user)
+):
+    session_id = str(uuid.uuid4())
+    ts = int(time.time() * 1000)
+    with neo4j_driver.session() as session:
+        session.run(
+            """
+            MATCH (u:User {username: $username})
+            CREATE (u)-[:HAS_SESSION]->(s:ChatSession {
+                id: $session_id, title: $title, doc_id: $doc_id, created_at: $ts
+            })
+            """,
+            username=user.username, session_id=session_id,
+            title=request.title[:120], doc_id=request.doc_id, ts=ts,
+        )
+    return {
+        "id": session_id, "title": request.title, "doc_id": request.doc_id,
+        "created_at": ts, "message_count": 0,
+    }
+
+
+@router.put("/chat/sessions/{session_id}")
+def rename_chat_session(
+    session_id: str,
+    request: ChatSessionUpdate,
+    user: CurrentUser = Depends(get_current_user),
+):
+    with neo4j_driver.session() as session:
+        updated = session.run(
+            """
+            MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
+            SET s.title = $title
+            RETURN s.id AS id
+            """,
+            username=user.username, session_id=session_id, title=request.title[:120],
+        ).single()
+    if not updated:
+        raise HTTPException(status_code=404, detail="That conversation was not found.")
+    return {"status": "success", "title": request.title}
+
+
+@router.put("/chat/sessions/{session_id}/document")
+def update_chat_session_document(
+    session_id: str,
+    request: ChatSessionDocUpdate,
+    user: CurrentUser = Depends(get_current_user),
+):
+    with neo4j_driver.session() as session:
+        updated = session.run(
+            """
+            MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
+            SET s.doc_id = $doc_id
+            RETURN s.id AS id
+            """,
+            username=user.username, session_id=session_id, doc_id=request.doc_id,
+        ).single()
+    if not updated:
+        raise HTTPException(status_code=404, detail="That conversation was not found.")
+    return {"status": "success", "doc_id": request.doc_id}
+
 
 @router.delete("/chat/sessions/{session_id}")
-async def delete_chat_session(session_id: str, username: str = Depends(get_current_user)):
-    try:
-        with neo4j_driver.session() as session:
-            # Delete all messages in the session, then delete the session itself
-            session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
-                OPTIONAL MATCH (s)-[r:HAS_MESSAGE]->(m:Message)
-                DETACH DELETE m, s
-            """, username=username, session_id=session_id)
-            return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def delete_chat_session(session_id: str, user: CurrentUser = Depends(get_current_user)):
+    with neo4j_driver.session() as session:
+        session.run(
+            """
+            MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
+            OPTIONAL MATCH (s)-[:HAS_MESSAGE]->(m:Message)
+            DETACH DELETE m, s
+            """,
+            username=user.username, session_id=session_id,
+        )
+    return {"status": "success"}
+
 
 @router.get("/chat/history/{session_id}")
-async def get_chat_history(session_id: str, username: str = Depends(get_current_user)):
-    try:
-        with neo4j_driver.session() as session:
-            # Verify the session belongs to the user
-            result = session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})-[:HAS_MESSAGE]->(m:Message)
-                RETURN m.role AS role, m.content AS content, m.timestamp AS timestamp
-                ORDER BY m.timestamp ASC
-                LIMIT 50
-            """, username=username, session_id=session_id)
-            messages = [{"role": record["role"], "content": record["content"]} for record in result]
-            return {"messages": messages}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-def query_pinecone(query: str, doc_id: str = None, top_k: int = 15, threshold: float = 0.0):
-    vector_store = PineconeVectorStore(index_name=index_name, embedding=get_embeddings())
-    if doc_id:
-        results = vector_store.similarity_search_with_score(query, k=top_k, filter={"doc_id": doc_id})
-    else:
-        results = vector_store.similarity_search_with_score(query, k=top_k)
-    context = [doc.page_content for doc, score in results if score >= threshold]
-    return "\n\n".join(context)
-
-def query_neo4j(query: str):
-    return ""
-
-@router.post("/chat")
-async def chat_with_archive(request: ChatRequest, username: str = Depends(get_current_user)):
-    try:
-        user_query = request.message
-        session_id = request.session_id
-        timestamp = int(time.time() * 1000)
-        
-        with neo4j_driver.session() as session:
-            # Ensure session belongs to user and get its doc_id
-            check = session.run("""
-                MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
-                RETURN s.doc_id AS doc_id
-            """, username=username, session_id=session_id)
-            record = check.single()
-            if not record:
-                raise HTTPException(status_code=404, detail="Session not found")
-            session_doc_id = record["doc_id"]
-                
-            # Save user message
-            session.run("""
-                MATCH (s:ChatSession {id: $session_id})
-                CREATE (s)-[:HAS_MESSAGE]->(m:Message {role: 'user', content: $content, timestamp: $ts})
-            """, session_id=session_id, content=user_query, ts=timestamp)
-            
-            # Fetch recent history for LLM Context (last 8 messages)
-            result = session.run("""
-                MATCH (s:ChatSession {id: $session_id})-[:HAS_MESSAGE]->(m:Message)
-                RETURN m.role AS role, m.content AS content
-                ORDER BY m.timestamp DESC
-                LIMIT 8
-            """, session_id=session_id)
-            
-            history_records = list(result)
-            history_records.reverse()
-            
-            history_text = ""
-            for record in history_records:
-                if record["content"] == user_query and record["role"] == 'user':
-                    continue
-                role_str = "User" if record["role"] == "user" else "AI"
-                history_text += f"{role_str}: {record['content']}\n"
-                
-            # Auto-title logic: if this is the first message in the session, update the title
-            if len(history_records) <= 1:
-                # Use AI to generate a catchy 2-3 word title
+def get_chat_history(session_id: str, user: CurrentUser = Depends(get_current_user)):
+    with neo4j_driver.session() as session:
+        result = session.run(
+            """
+            MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession {id: $session_id})
+                  -[:HAS_MESSAGE]->(m:Message)
+            RETURN m.role AS role, m.content AS content, m.citations AS citations,
+                   m.timestamp AS timestamp
+            ORDER BY m.timestamp ASC
+            LIMIT 200
+            """,
+            username=user.username, session_id=session_id,
+        )
+        messages = []
+        for r in result:
+            message = {"role": r["role"], "content": r["content"]}
+            if r["citations"]:
                 try:
-                    title_prompt = ChatPromptTemplate.from_messages([
-                        ("system", "You are a title generator. Given a user's message, generate a catchy, short title of EXACTLY 2-3 words that captures its essence. Return ONLY the title, nothing else. No quotes, no punctuation at the end."),
-                        ("human", "{message}")
-                    ])
-                    title_chain = title_prompt | llm | StrOutputParser()
-                    title = title_chain.invoke({"message": user_query}).strip().strip('"').strip("'")[:40]
-                    if not title or len(title) < 3:
-                        raise ValueError("Bad title")
-                except Exception:
-                    words = user_query.split()[:3]
-                    title = " ".join(words)
-                session.run("""
-                    MATCH (s:ChatSession {id: $session_id})
-                    SET s.title = $title
-                """, session_id=session_id, title=title)
-        
-        vector_context = query_pinecone(user_query, doc_id=session_doc_id)
-        graph_context = query_neo4j(user_query)
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are ArchiveMind AI, a helpful, polite, and professional government policy research assistant.\n"
-                       "CRITICAL RULES FOR BEHAVIOR:\n"
-                       "1. ALWAYS maintain a helpful, warm, and professional tone.\n"
-                       "2. NEVER adopt a persona, character, or robotic tone (e.g., 'Chitti' or saying 'Affirmative/Terminate'), even if the user asks you to or is frustrated.\n"
-                       "3. If the user is frustrated, apologize politely and try to assist them.\n"
-                       "4. Answer the user's question using the CONTEXT provided below. If the exact answer is missing, provide the most relevant information you can find in the context.\n"
-                       "5. FORMATTING: You must strictly format your responses to be extremely easy to read. NEVER output a wall of text. ALWAYS use bullet points for lists, insert blank lines between paragraphs, and use bolding for emphasis.\n"
-                       "6. COPY FEATURE: If the user specifically asks to 'copy' the response, or asks you to generate content for a 'document', 'word document', or 'report', you MUST wrap your ENTIRE text response inside a Markdown code block (e.g., ```markdown ... ```). This triggers the UI's copy button for them.\n"
-                       "7. STRICT RELEVANCE: Answer ONLY what the user asks. NEVER include unrequested extras like flowcharts, diagrams, or unrelated sections unless explicitly requested.\n\n"
-                       "CONVERSATION HISTORY:\n{history}\n\n"
-                       "CONTEXT:\n{context}"),
-            ("human", "{question}")
-        ])
-        
-        chain = prompt | llm | StrOutputParser()
-        combined_context = f"--- Document Excerpts ---\n{vector_context}\n\n--- Graph Relationships ---\n{graph_context}"
-        
+                    message["citations"] = json.loads(r["citations"])
+                except (ValueError, TypeError):
+                    pass
+            messages.append(message)
+    return {"messages": messages}
+
+
+# --- Chat --------------------------------------------------------------------
+@router.post("/chat")
+def chat_with_archive(request: ChatRequest, user: CurrentUser = Depends(get_current_user)):
+    question = request.message.strip()
+    session_id = request.session_id
+    started = time.perf_counter()
+    timestamp = int(time.time() * 1000)
+
+    with neo4j_driver.session() as session:
+        doc_id = _session_doc_id(session, session_id, user.username)
+
+        session.run(
+            """
+            MATCH (s:ChatSession {id: $session_id})
+            CREATE (s)-[:HAS_MESSAGE]->(m:Message {
+                id: $id, role: 'user', content: $content, timestamp: $ts
+            })
+            """,
+            session_id=session_id, id=str(uuid.uuid4()),
+            content=question, ts=timestamp,
+        )
+
+        history_records = list(session.run(
+            """
+            MATCH (s:ChatSession {id: $session_id})-[:HAS_MESSAGE]->(m:Message)
+            RETURN m.role AS role, m.content AS content
+            ORDER BY m.timestamp DESC
+            LIMIT $limit
+            """,
+            session_id=session_id, limit=config.HISTORY_TURNS * 2,
+        ))
+        history_records.reverse()
+        is_first_message = len(history_records) <= 1
+
+    history_lines = []
+    for record in history_records:
+        if record["role"] == "user" and record["content"] == question:
+            continue
+        speaker = "User" if record["role"] == "user" else "Assistant"
+        history_lines.append(f"{speaker}: {record['content'][:1500]}")
+    history_text = "\n".join(history_lines)
+
+    if is_first_message:
+        _autotitle_session(session_id, question)
+
+    # --- Retrieval ---
+    passages = retrieval.retrieve(question, doc_id=doc_id, history=history_text)
+    best_score = max((p.score for p in passages), default=0.0)
+    scope = _document_name(doc_id)
+
+    if not passages or best_score < ABSTAIN_THRESHOLD:
+        answer = NO_CONTEXT_ANSWER.format(scope=scope)
+        _save_answer(session_id, answer, [])
+        _log_query(user.username, question, doc_id, best_score, answered=False)
+        return {
+            "answer": answer,
+            "sources_used": False,
+            "citations": [],
+            "grounded": False,
+            "graph_used": False,
+            "elapsed_seconds": round(time.perf_counter() - started, 2),
+        }
+
+    context = retrieval.format_context(passages)
+    graph_text = graph_store.graph_context(question, doc_id)
+
+    try:
+        chain = chat_prompt | smart_llm | StrOutputParser()
         answer = chain.invoke({
-            "history": history_text,
-            "context": combined_context,
-            "question": user_query
+            "history": history_text or "(this is the first message)",
+            "context": context,
+            "graph": graph_text or "(no relationships extracted yet for this topic)",
+            "question": question,
         })
-        
-        # Save AI Answer
-        ai_timestamp = int(time.time() * 1000) + 1
+    except Exception:
+        logger.exception("Answer generation failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Every language model provider is currently unavailable. Please try again shortly.",
+        )
+
+    citations = retrieval.build_citations(passages)
+    _save_answer(session_id, answer, citations)
+    _log_query(user.username, question, doc_id, best_score, answered=True)
+
+    return {
+        "answer": answer,
+        "sources_used": True,
+        "citations": citations,
+        "grounded": True,
+        "graph_used": bool(graph_text),
+        "elapsed_seconds": round(time.perf_counter() - started, 2),
+    }
+
+
+def _autotitle_session(session_id: str, question: str) -> None:
+    try:
+        title_prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "Generate a title of exactly 2 to 4 words capturing what this "
+             "question is about. Title Case. No quotes, no trailing punctuation. "
+             "Return only the title."),
+            ("human", "{message}"),
+        ])
+        chain = title_prompt | fast_llm | StrOutputParser()
+        title = chain.invoke({"message": question}).strip().strip('"').strip("'")[:60]
+        if len(title) < 3:
+            raise ValueError("title too short")
+    except Exception:
+        title = " ".join(question.split()[:4])[:60] or "New Chat"
+
+    try:
         with neo4j_driver.session() as session:
-            session.run("""
-                MATCH (s:ChatSession {id: $session_id})
-                CREATE (s)-[:HAS_MESSAGE]->(m:Message {role: 'ai', content: $content, timestamp: $ts})
-            """, session_id=session_id, content=answer, ts=ai_timestamp)
-        
-        return {"answer": answer, "sources_used": len(vector_context) > 0}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            session.run(
+                "MATCH (s:ChatSession {id: $session_id}) SET s.title = $title",
+                session_id=session_id, title=title,
+            )
+    except Exception as exc:
+        logger.debug("Auto-title failed: %s", exc)
+
+
+def _save_answer(session_id: str, answer: str, citations: List[dict]) -> None:
+    with neo4j_driver.session() as session:
+        session.run(
+            """
+            MATCH (s:ChatSession {id: $session_id})
+            CREATE (s)-[:HAS_MESSAGE]->(m:Message {
+                id: $id, role: 'ai', content: $content,
+                citations: $citations, timestamp: $ts
+            })
+            """,
+            session_id=session_id, id=str(uuid.uuid4()), content=answer,
+            citations=json.dumps(citations) if citations else None,
+            ts=int(time.time() * 1000) + 1,
+        )
+
+
+# --- Document comparison -----------------------------------------------------
+@router.post("/documents/compare")
+def compare_documents(request: CompareRequest, user: CurrentUser = Depends(get_current_user)):
+    """Structured comparison across documents.
+
+    This is the capability the architecture makes possible that a plain
+    chat-with-PDF tool cannot do, and overlapping government schemes are
+    exactly the case it serves.
+    """
+    doc_ids = [d for d in request.doc_ids if d][:3]
+    if len(doc_ids) < 2:
+        raise HTTPException(status_code=400, detail="Choose at least two documents to compare.")
+
+    focus = request.focus.strip() or "objectives, eligibility, benefits, and obligations"
+
+    sections = []
+    all_citations: List[dict] = []
+    offset = 0
+    for doc_id in doc_ids:
+        name = _document_name(doc_id)
+        passages = retrieval.retrieve(focus, doc_id=doc_id, final_k=5, condense=False)
+        if not passages:
+            sections.append(f"### {name}\n(no relevant passages found)")
+            continue
+        numbered = [
+            f"[{i}] {passage.text.strip()}"
+            for i, passage in enumerate(passages, start=offset + 1)
+        ]
+        offset += len(passages)
+        sections.append(f"### {name}\n" + "\n\n".join(numbered))
+        for citation in retrieval.build_citations(passages):
+            citation["n"] = len(all_citations) + 1
+            all_citations.append(citation)
+
+    if not all_citations:
+        raise HTTPException(
+            status_code=404,
+            detail="No comparable content was found in those documents for that focus.",
+        )
+
+    compare_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You compare government policy documents for an analyst.\n"
+         "Use ONLY the provided excerpts and cite every claim as [n].\n"
+         "Structure the response exactly as:\n"
+         "## Summary - two sentences on how these documents relate.\n"
+         "## Side by side - a markdown table, one row per attribute, one column "
+         "per document.\n"
+         "## Where they agree - bullets.\n"
+         "## Where they differ or conflict - bullets. Be specific about which "
+         "document says what.\n"
+         "## Gaps - what one covers that the others do not.\n"
+         "If the excerpts do not support a section, write 'Not covered in the "
+         "provided excerpts.' rather than inventing content."),
+        ("human", "Focus: {focus}\n\n{sections}"),
+    ])
+
+    try:
+        chain = compare_prompt | smart_llm | StrOutputParser()
+        comparison = chain.invoke({"focus": focus, "sections": "\n\n".join(sections)})
+    except Exception:
+        logger.exception("Comparison failed")
+        raise HTTPException(
+            status_code=503,
+            detail="The comparison could not be generated. Please try again shortly.",
+        )
+
+    return {
+        "comparison": comparison,
+        "citations": all_citations,
+        "documents": [{"id": d, "filename": _document_name(d)} for d in doc_ids],
+    }
+
+
+# --- Stats and recommendations ----------------------------------------------
+@router.get("/stats")
+def get_user_stats(user: CurrentUser = Depends(get_current_user)):
+    """Dashboard figures, counted from the real graph rather than from summaries."""
+    with neo4j_driver.session() as session:
+        doc_ids = [r["id"] for r in session.run("MATCH (d:Document) RETURN d.id AS id")]
+        totals = session.run(
+            """
+            MATCH (d:Document)
+            OPTIONAL MATCH (c:Chunk)-[:PART_OF]->(d)
+            RETURN count(DISTINCT d) AS documents, count(c) AS chunks
+            """
+        ).single()
+        my_sessions = session.run(
+            "MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession) "
+            "RETURN count(s) AS n",
+            username=user.username,
+        ).single()
+
+    stats = graph_store.graph_stats(doc_ids or None)
+    top = graph_store.top_entities(doc_ids or None, limit=15)
+
+    return {
+        "total_entities": stats["entities"],
+        "total_relations": stats["relations"],
+        "total_documents": (totals["documents"] if totals else 0) or 0,
+        "total_chunks": (totals["chunks"] if totals else 0) or 0,
+        "my_sessions": (my_sessions["n"] if my_sessions else 0) or 0,
+        "top_entities": [
+            {"name": e["name"], "count": e["count"], "type": e["type"]} for e in top
+        ],
+    }
+
+
+@router.get("/chat/recommendations")
+def get_chat_recommendations(user: CurrentUser = Depends(get_current_user)):
+    """Topics to explore next, grounded in what the archive actually contains.
+
+    There used to be two handlers registered on this path; FastAPI bound the
+    first and the second was unreachable. This is the single implementation.
+    """
+    with neo4j_driver.session() as session:
+        doc_ids = [r["id"] for r in session.run("MATCH (d:Document) RETURN d.id AS id")]
+
+    entities = graph_store.top_entities(doc_ids or None, limit=12)
+    candidates = [e["name"] for e in entities if len(e["name"]) > 4][:8]
+
+    if not candidates:
+        # Fall back to the document profiles while the graph is still empty.
+        seen: List[str] = []
+        with neo4j_driver.session() as session:
+            for row in session.run("MATCH (d:Document) RETURN d.key_entities AS ke LIMIT 20"):
+                try:
+                    for name in json.loads(row["ke"] or "[]"):
+                        cleaned = str(name).strip()
+                        if len(cleaned) > 4 and cleaned not in seen:
+                            seen.append(cleaned)
+                except (ValueError, TypeError):
+                    continue
+        candidates = seen[:8]
+
+    if not candidates:
+        return {"recommendations": ["Public Health", "Tax Policies", "Education Reform"]}
+
+    return {"recommendations": candidates[:3]}
+
+
+# --- Admin analytics ---------------------------------------------------------
+@router.get("/analytics/unanswered")
+def unanswered_questions(
+    limit: int = Query(20, ge=1, le=100),
+    _: CurrentUser = Depends(require_admin),
+):
+    """Questions the archive could not answer - the ingestion backlog.
+
+    This is the most actionable panel on the dashboard: it turns a user's dead
+    end into a concrete decision about which document to add next.
+    """
+    with neo4j_driver.session() as session:
+        rows = session.run(
+            """
+            MATCH (q:QueryLog)
+            WHERE q.answered = false
+            RETURN q.question AS question, q.doc_id AS doc_id,
+                   q.best_score AS best_score, q.created_at AS created_at
+            ORDER BY q.created_at DESC
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        questions = [
+            {
+                "question": r["question"],
+                "doc_id": r["doc_id"],
+                "best_score": round(r["best_score"] or 0.0, 3),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    return {"questions": questions}
+
+
+@router.get("/analytics/overview")
+def analytics_overview(_: CurrentUser = Depends(require_admin)):
+    """Query volume, answer rate and the most consulted documents."""
+    now_ms = int(time.time() * 1000)
+    day_ago = now_ms - 86_400_000
+    week_ago = now_ms - 7 * 86_400_000
+
+    with neo4j_driver.session() as session:
+        totals = session.run(
+            """
+            MATCH (q:QueryLog)
+            RETURN count(q) AS total,
+                   sum(CASE WHEN q.answered THEN 1 ELSE 0 END) AS answered,
+                   sum(CASE WHEN q.created_at > $day THEN 1 ELSE 0 END) AS last_day,
+                   sum(CASE WHEN q.created_at > $week THEN 1 ELSE 0 END) AS last_week
+            """,
+            day=day_ago, week=week_ago,
+        ).single()
+
+        top_docs = [
+            {"doc_id": r["doc_id"], "filename": r["filename"], "queries": r["queries"]}
+            for r in session.run(
+                """
+                MATCH (q:QueryLog) WHERE q.doc_id IS NOT NULL
+                OPTIONAL MATCH (d:Document {id: q.doc_id})
+                RETURN q.doc_id AS doc_id, d.filename AS filename, count(q) AS queries
+                ORDER BY queries DESC
+                LIMIT 5
+                """
+            )
+        ]
+
+    total = (totals["total"] if totals else 0) or 0
+    answered = (totals["answered"] if totals else 0) or 0
+    return {
+        "total_queries": total,
+        "answered": answered,
+        "unanswered": total - answered,
+        "answer_rate": round(answered / total, 3) if total else None,
+        "last_24h": (totals["last_day"] if totals else 0) or 0,
+        "last_7d": (totals["last_week"] if totals else 0) or 0,
+        "top_documents": top_docs,
+    }
