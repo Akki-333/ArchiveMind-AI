@@ -143,8 +143,28 @@ fast_llm = _chain(
 llm = smart_llm
 
 
-def ping() -> dict:
-    """Cheap liveness probe for the health endpoint. Never raises."""
+def ping(deep: bool = False) -> dict:
+    """Liveness of the LLM chain. Never raises.
+
+    `deep=False` (the default) reports only whether a provider chain was
+    constructed. That is not nothing: it catches a missing key, an uninstalled
+    integration package and a malformed model id at import time, which is most
+    of what actually breaks.
+
+    `deep=True` bills a real completion. That used to be the only behaviour, and
+    the health endpoint calling it was unauthenticated and polled every sixty
+    seconds by every open dashboard - so a status badge quietly spent the
+    free-tier quota it was reporting on, and any anonymous caller could drain it
+    deliberately. Deep probes are now explicit, admin-only and cached.
+    """
+    if not deep:
+        return {
+            "status": "up" if ACTIVE_PROVIDERS else "down",
+            "latency_ms": 0,
+            "providers": ACTIVE_PROVIDERS,
+            "checked": "configuration",
+        }
+
     started = time.perf_counter()
     try:
         response = fast_llm.invoke("Reply with the single word: ok")
@@ -153,6 +173,7 @@ def ping() -> dict:
             "status": "up",
             "latency_ms": int((time.perf_counter() - started) * 1000),
             "providers": ACTIVE_PROVIDERS,
+            "checked": "completion",
             "sample": str(text)[:40],
         }
     except Exception as exc:
@@ -160,5 +181,6 @@ def ping() -> dict:
             "status": "down",
             "latency_ms": int((time.perf_counter() - started) * 1000),
             "providers": ACTIVE_PROVIDERS,
+            "checked": "completion",
             "error": type(exc).__name__,
         }

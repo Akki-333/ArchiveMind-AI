@@ -125,6 +125,31 @@ MIN_PASSWORD_LENGTH = _int("MIN_PASSWORD_LENGTH", 8)
 LOGIN_MAX_ATTEMPTS = _int("LOGIN_MAX_ATTEMPTS", 8)
 LOGIN_WINDOW_SECONDS = _int("LOGIN_WINDOW_SECONDS", 300)
 
+# --- Rate limits -------------------------------------------------------------
+# Sign-in used to be the only throttled route while the ones that spend money -
+# chat, upload, graph extraction - were open. Set any limit to 0 to disable it.
+# Windows are seconds; limits are requests per window per authenticated user.
+CHAT_RATE_LIMIT = _int("CHAT_RATE_LIMIT", 30)
+CHAT_RATE_WINDOW = _int("CHAT_RATE_WINDOW", 60)
+UPLOAD_RATE_LIMIT = _int("UPLOAD_RATE_LIMIT", 10)
+UPLOAD_RATE_WINDOW = _int("UPLOAD_RATE_WINDOW", 3600)
+GRAPH_RATE_LIMIT = _int("GRAPH_RATE_LIMIT", 20)
+GRAPH_RATE_WINDOW = _int("GRAPH_RATE_WINDOW", 60)
+COMPARE_RATE_LIMIT = _int("COMPARE_RATE_LIMIT", 10)
+COMPARE_RATE_WINDOW = _int("COMPARE_RATE_WINDOW", 300)
+
+# --- Health ------------------------------------------------------------------
+# /health/db performs real round-trips, and the deep variant bills an LLM call.
+# Caching stops an open dashboard turning a status badge into a standing cost,
+# and the deep probe is opt-in rather than on by default.
+HEALTH_CACHE_SECONDS = _int("HEALTH_CACHE_SECONDS", 30)
+
+# --- Privacy -----------------------------------------------------------------
+# Questions are logged so administrators can see what the archive cannot answer.
+# That is a record of what citizens asked a government service, so it does not
+# get to live forever. Pruned on boot and daily thereafter. 0 disables pruning.
+QUERY_LOG_RETENTION_DAYS = _int("QUERY_LOG_RETENTION_DAYS", 90)
+
 # SEC-1: roles are never accepted from a client. Admins are named here, granted
 # a shared access code out of band, or bootstrapped as the very first account on
 # an empty database.

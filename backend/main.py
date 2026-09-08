@@ -6,11 +6,12 @@ driver internals leaking to clients.
 """
 import logging
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -58,6 +59,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         # A schema failure degrades lexical search but must not stop the app.
         logger.error("Schema migration could not run: %s", exc)
+
+    # Question logs are a record of what citizens asked a government service.
+    # Prune them to the retention window on boot; the analytics routes repeat
+    # this at most daily, so no scheduler is required.
+    try:
+        removed = querying.prune_query_log(force=True)
+        logger.info(
+            "Query-log retention: %d days, %d expired entries removed.",
+            config.QUERY_LOG_RETENTION_DAYS, removed,
+        )
+    except Exception as exc:
+        logger.warning("Query-log pruning failed at startup: %s", exc)
 
     logger.info("LLM providers: %s", ", ".join(llm.ACTIVE_PROVIDERS) or "none")
     yield
@@ -146,16 +159,17 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/health/db")
-def health_db():
-    """Real round-trips to every dependency.
+# A dependency probe is not free: two network round-trips, and a deep probe
+# bills an LLM completion. An open dashboard polls this every 60 seconds, so
+# without a cache the badge costs more than the thing it reports on.
+_health_cache: dict = {"shallow": (0.0, None), "deep": (0.0, None)}
+_health_lock = threading.Lock()
 
-    The dashboard used to render hardcoded green "Connected" strings whether or
-    not anything was reachable. This is what those badges read from now.
-    """
+
+def _probe(deep: bool) -> dict:
     neo4j_status = database.check_neo4j()
     pinecone_status = database.check_pinecone()
-    llm_status = llm.ping()
+    llm_status = llm.ping(deep=deep)
 
     services = {"neo4j": neo4j_status, "pinecone": pinecone_status, "llm": llm_status}
     down = [name for name, s in services.items() if s.get("status") != "up"]
@@ -164,15 +178,56 @@ def health_db():
         "status": "degraded" if down else "ok",
         "unavailable": down,
         "services": services,
+        "depth": "completion" if deep else "configuration",
         # Legacy keys, kept so an older frontend build does not break.
         "pinecone_configured": pinecone_status.get("status") == "up",
         "neo4j_configured": neo4j_status.get("status") == "up",
     }
 
 
+@app.get("/health/db")
+def health_db(
+    deep: bool = False,
+    _: auth.CurrentUser = Depends(auth.require_admin),
+):
+    """Real round-trips to every dependency. Administrators only.
+
+    Three things this fixes, all of which were live problems:
+
+    1. It was unauthenticated and `llm.ping()` made a real completion, so anyone
+       could loop it to exhaust the free-tier quota - after which every user's
+       chat returned 503. An unauthenticated endpoint must never be able to
+       spend money.
+    2. It is cached, so a dashboard left open does not become a standing cost.
+    3. The completion is opt-in via `?deep=1`. The default reports whether the
+       provider chain was built, which catches the common failures - a missing
+       key, an uninstalled package, a bad model id.
+
+    `/health` stays public and free for the platform's own health check.
+    """
+    slot = "deep" if deep else "shallow"
+    now = time.time()
+
+    with _health_lock:
+        cached_at, cached = _health_cache[slot]
+        if cached and now - cached_at < config.HEALTH_CACHE_SECONDS:
+            return {**cached, "cached": True}
+
+    payload = _probe(deep)
+
+    with _health_lock:
+        _health_cache[slot] = (time.time(), payload)
+    return {**payload, "cached": False}
+
+
 @app.get("/health/config")
-def health_config():
-    """Non-secret configuration snapshot, useful when debugging a deployment."""
+def health_config(_: auth.CurrentUser = Depends(auth.require_admin)):
+    """Non-secret configuration snapshot, useful when debugging a deployment.
+
+    Administrators only. Nothing here is a credential, but it names the index,
+    the configured providers, the retrieval tuning and whether an admin access
+    code is set - free reconnaissance for anyone deciding where to push.
+    """
     return config.summary()
 
 
