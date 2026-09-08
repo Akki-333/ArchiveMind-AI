@@ -640,6 +640,18 @@ export const SettingsPanel = ({
                     Official access requested — waiting for an administrator to approve it.
                   </p>
                 )}
+                {/*
+                  Telling people their questions are recorded is not optional
+                  politeness. This is a government service, the log is shown to
+                  administrators, and someone asking what benefits they qualify
+                  for deserves to know that before they type it.
+                */}
+                <p className="text-[11px] text-slate-400 mt-3 leading-relaxed">
+                  Questions you ask are recorded so administrators can see which
+                  documents the archive is missing. They are deleted automatically
+                  after the retention period, and the coverage reports group them
+                  by topic rather than showing them next to your name.
+                </p>
                 {profile && (
                   <div className="flex gap-4 mt-3 pt-3 border-t border-slate-200 dark:border-slate-600">
                     <span className="text-xs text-slate-500 dark:text-slate-400">
