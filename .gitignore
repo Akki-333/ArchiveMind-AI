@@ -42,6 +42,14 @@ Thumbs.db
 # Temporary/Debug Files (Do not push to Github)
 debug_output.txt
 debug_*.py
-test_*.py
 download_*.py
 poc/
+
+# Note: `test_*.py` used to be ignored here, which meant the repository
+# structurally could not hold a test suite. Real tests live in backend/tests/.
+
+# Test and build artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+coverage/

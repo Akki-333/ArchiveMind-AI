@@ -1040,7 +1040,13 @@ def _topic_phrase(question: str) -> str:
     text = re.sub(r"\b(documents?|archive|file|pdf)\b\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip(" ?.!,:;-")
     if not text:
-        text = question.strip(" ?.!")
+        # Stripping can consume the whole string - "?" and "how" leave nothing
+        # behind. Fall back to the raw question, and to a label of last resort
+        # if even that is empty, because a blank chip on the dashboard is worse
+        # than a clumsy one.
+        text = question.strip(" ?.!,:;-") or question.strip()
+    if not text:
+        return "Unlabelled request"
     return (text[:1].upper() + text[1:])[:90]
 
 
