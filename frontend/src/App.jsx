@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react';
 import { BrowserRouter as Router, Navigate, Route, Routes } from 'react-router-dom';
 import {
   GitCompare, LayoutDashboard, LogOut, MessageSquare, Network, Settings,
@@ -10,12 +10,35 @@ import {
   setUnauthorizedHandler, storedSession,
 } from './api';
 import { SettingsPanel, SidebarLink, Spinner } from './components/common';
-import {
-  AuthScreen, CompareScreen, Dashboard, UploadScreen, UserDashboard, UsersScreen,
-} from './pages/Dashboards';
-import ChatScreen from './pages/ChatScreen';
-import GraphScreen from './pages/GraphScreen';
+import { AuthScreen } from './pages/AuthScreen';
 import logoImg from './assets/logo.jpg';
+
+/**
+ * Every screen behind the sign-in wall is code-split.
+ *
+ * The whole application used to load on first paint, including the mind map
+ * explorer's graph library and the markdown and diagram renderers - none of
+ * which the sign-in screen needs, and most of which a given session never
+ * opens. AuthScreen stays eager because it is the first thing rendered.
+ */
+const ChatScreen = lazy(() => import('./pages/ChatScreen'));
+const GraphScreen = lazy(() => import('./pages/GraphScreen'));
+const UserDashboard = lazy(() =>
+  import('./pages/UserDashboard').then((m) => ({ default: m.UserDashboard })));
+const Dashboard = lazy(() =>
+  import('./pages/AdminDashboard').then((m) => ({ default: m.Dashboard })));
+const UploadScreen = lazy(() =>
+  import('./pages/UploadScreen').then((m) => ({ default: m.UploadScreen })));
+const CompareScreen = lazy(() =>
+  import('./pages/CompareScreen').then((m) => ({ default: m.CompareScreen })));
+const UsersScreen = lazy(() =>
+  import('./pages/UsersScreen').then((m) => ({ default: m.UsersScreen })));
+
+const RouteFallback = () => (
+  <div className="h-full flex items-center justify-center">
+    <Spinner size={24} className="text-sky-500" />
+  </div>
+);
 
 const App = () => {
   const [booting, setBooting] = useState(true);
@@ -202,7 +225,8 @@ const App = () => {
         </aside>
 
         <main className="flex-1 overflow-y-auto dark:bg-slate-900 dark:text-slate-100 min-w-0">
-          <Routes>
+          <Suspense fallback={<RouteFallback />}>
+            <Routes>
             <Route
               path="/"
               element={
@@ -273,7 +297,8 @@ const App = () => {
               }
             />
             <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+            </Routes>
+          </Suspense>
         </main>
       </div>
     </Router>
