@@ -136,6 +136,103 @@ export const sendMessage = (message, sessionId) =>
   api.post('/api/chat', { message, session_id: sessionId }).then((r) => r.data);
 
 /**
+ * The same answer as `sendMessage`, delivered as it is written.
+ *
+ * Uses `fetch` rather than the axios instance because axios buffers the whole
+ * response before resolving, which is precisely what this avoids. That means
+ * re-implementing the two things the axios interceptors do - attach the token,
+ * and clear the session once on a 401 - so both are done explicitly below.
+ *
+ * `handlers` may provide onStatus(stage), onCitations(list), onToken(text) and
+ * onDone(payload). Resolves to the final payload, which has the same shape
+ * `sendMessage` resolves to, so a caller can fall back to it on failure.
+ */
+export async function streamMessage(message, sessionId, handlers = {}) {
+  const token = localStorage.getItem('token');
+  const response = await fetch(`${api.defaults.baseURL}/api/chat/stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ message, session_id: sessionId }),
+  });
+
+  if (response.status === 401) {
+    clearSession();
+    if (onUnauthorized) onUnauthorized();
+    throw new Error('Your session has expired. Please sign in again.');
+  }
+
+  if (!response.ok || !response.body) {
+    let detail = 'That answer could not be generated.';
+    try {
+      const body = await response.json();
+      if (typeof body?.detail === 'string') detail = body.detail;
+    } catch {
+      // A non-JSON error body is not worth a second failure.
+    }
+    throw new Error(detail);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let final = null;
+  let streamError = null;
+
+  const handle = (event) => {
+    switch (event.type) {
+      case 'status':
+        handlers.onStatus?.(event.stage);
+        break;
+      case 'citations':
+        handlers.onCitations?.(event.citations || []);
+        break;
+      case 'token':
+        handlers.onToken?.(event.text || '');
+        break;
+      case 'done':
+        final = event;
+        handlers.onDone?.(event);
+        break;
+      case 'error':
+        streamError = event.detail || 'That answer could not be generated.';
+        break;
+      default:
+        break;
+    }
+  };
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    // eslint-disable-next-line no-await-in-loop
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    // A frame ends at a blank line. Whatever arrived mid-frame stays in the
+    // buffer and is carried into the next read rather than parsed early.
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() || '';
+
+    for (const frame of frames) {
+      const line = frame.split('\n').find((l) => l.startsWith('data:'));
+      if (!line) continue;
+      try {
+        handle(JSON.parse(line.slice(5).trim()));
+      } catch {
+        // A malformed frame should not abort a stream that is otherwise fine.
+      }
+    }
+  }
+
+  if (streamError) throw new Error(streamError);
+  if (!final) throw new Error('The answer ended unexpectedly. Please try again.');
+  return final;
+}
+
+/**
  * Rewrite a question already asked and regenerate from that point.
  * The server drops that message and everything after it before re-answering,
  * so the transcript never shows a reply to a question that was never asked.

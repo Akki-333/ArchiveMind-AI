@@ -276,6 +276,14 @@ export const ChatMessage = ({ message, msgRef, onEdit, darkMode, busy }) => {
               darkMode={darkMode}
               onCitationSelect={setOpenCitation}
             />
+            {/*
+              A caret while tokens are still arriving. Without it a pause
+              between chunks is indistinguishable from a finished answer, and
+              the reader starts acting on a half-written one.
+            */}
+            {message.streaming && (
+              <span className="inline-block w-[2px] h-4 align-text-bottom bg-sky-500 animate-pulse ml-0.5" />
+            )}
             <Citations
               citations={message.citations}
               openN={openCitation}
@@ -290,10 +298,14 @@ export const ChatMessage = ({ message, msgRef, onEdit, darkMode, busy }) => {
           </>
         )}
 
+        {/* Copying or editing a half-written answer gets you a half-written
+            answer, so the controls wait until the stream finishes. */}
         <div
           className={`absolute -bottom-3.5 ${
             isUser ? 'right-2' : 'left-2'
-          } flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-all`}
+          } flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-all ${
+            message.streaming ? 'hidden' : ''
+          }`}
         >
           {canEdit && (
             <button

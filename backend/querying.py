@@ -16,9 +16,11 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -551,21 +553,36 @@ def get_chat_history(session_id: str, user: CurrentUser = Depends(get_current_us
 
 
 # --- Chat --------------------------------------------------------------------
-def _answer_question(
-    session_id: str,
-    doc_id: Optional[str],
-    question: str,
-    username: str,
-    started: float,
-) -> dict:
-    """Retrieve, generate, persist. Shared by /chat and /chat/edit.
+@dataclass
+class _AnswerPlan:
+    """Everything decided before a single token is generated.
 
-    Both entry points must behave identically - an edited question deserves the
-    same retrieval, the same grounding and the same citations as the original.
-    Keeping one implementation is the only way that stays true.
+    Split out so the buffered and streaming endpoints share one implementation
+    of retrieval, abstention and citation building. Two copies of this logic
+    would drift, and the copy that drifted would be the one that quietly
+    stopped abstaining.
     """
+    history_text: str
+    passages: list
+    context: str
+    graph_text: str
+    citations: list
+    best_score: float
+    scope: str
+    abstain: bool
+
+    @property
+    def prompt_inputs(self) -> dict:
+        return {
+            "history": self.history_text or "(this is the first message)",
+            "context": self.context,
+            "graph": self.graph_text or "(no relationships extracted yet for this topic)",
+        }
+
+
+def _conversation_history(session_id: str, question: str) -> str:
     with neo4j_driver.session() as session:
-        history_records = list(session.run(
+        records = list(session.run(
             """
             MATCH (s:ChatSession {id: $session_id})-[:HAS_MESSAGE]->(m:Message)
             RETURN m.role AS role, m.content AS content
@@ -574,20 +591,23 @@ def _answer_question(
             """,
             session_id=session_id, limit=config.HISTORY_TURNS * 2,
         ))
-    history_records.reverse()
+    records.reverse()
 
-    history_lines = []
-    for record in history_records:
+    lines = []
+    for record in records:
         if record["role"] == "user" and record["content"] == question:
             continue
         speaker = "User" if record["role"] == "user" else "Assistant"
-        history_lines.append(f"{speaker}: {record['content'][:1500]}")
-    history_text = "\n".join(history_lines)
+        lines.append(f"{speaker}: {record['content'][:1500]}")
+    return "\n".join(lines)
 
-    # --- Retrieval ---
+
+def _plan_answer(session_id: str, doc_id: Optional[str], question: str) -> _AnswerPlan:
+    """Retrieve and decide whether there is anything worth answering from."""
+    history_text = _conversation_history(session_id, question)
+
     passages = retrieval.retrieve(question, doc_id=doc_id, history=history_text)
     best_score = max((p.score for p in passages), default=0.0)
-    scope = _document_name(doc_id)
 
     # Abstain only when there is genuinely nothing to work with.
     #
@@ -601,14 +621,48 @@ def _answer_question(
     #     evidence that a 384-dimensional embedding cannot represent.
     broad = retrieval.is_broad_query(question)
     exact_hit = any("lexical" in p.found_by for p in passages)
-    should_abstain = not passages or (
+    abstain = not passages or (
         best_score < ABSTAIN_THRESHOLD and not broad and not exact_hit
     )
 
-    if should_abstain:
-        answer = NO_CONTEXT_ANSWER.format(scope=scope)
+    if abstain:
+        return _AnswerPlan(
+            history_text=history_text, passages=[], context="", graph_text="",
+            citations=[], best_score=best_score, scope=_document_name(doc_id),
+            abstain=True,
+        )
+
+    return _AnswerPlan(
+        history_text=history_text,
+        passages=passages,
+        context=retrieval.format_context(passages),
+        graph_text=graph_store.graph_context(question, doc_id),
+        citations=retrieval.build_citations(passages),
+        best_score=best_score,
+        scope=_document_name(doc_id),
+        abstain=False,
+    )
+
+
+def _answer_question(
+    session_id: str,
+    doc_id: Optional[str],
+    question: str,
+    username: str,
+    started: float,
+) -> dict:
+    """Retrieve, generate, persist. Shared by /chat and /chat/edit.
+
+    Both entry points must behave identically - an edited question deserves the
+    same retrieval, the same grounding and the same citations as the original.
+    Keeping one implementation is the only way that stays true.
+    """
+    plan = _plan_answer(session_id, doc_id, question)
+
+    if plan.abstain:
+        answer = NO_CONTEXT_ANSWER.format(scope=plan.scope)
         _save_answer(session_id, answer, [])
-        _log_query(username, question, doc_id, best_score, answered=False)
+        _log_query(username, question, doc_id, plan.best_score, answered=False)
         return {
             "answer": answer,
             "sources_used": False,
@@ -618,17 +672,9 @@ def _answer_question(
             "elapsed_seconds": round(time.perf_counter() - started, 2),
         }
 
-    context = retrieval.format_context(passages)
-    graph_text = graph_store.graph_context(question, doc_id)
-
     try:
         chain = chat_prompt | smart_llm | StrOutputParser()
-        answer = chain.invoke({
-            "history": history_text or "(this is the first message)",
-            "context": context,
-            "graph": graph_text or "(no relationships extracted yet for this topic)",
-            "question": question,
-        })
+        answer = chain.invoke({**plan.prompt_inputs, "question": question})
     except Exception:
         logger.exception("Answer generation failed")
         raise HTTPException(
@@ -637,18 +683,109 @@ def _answer_question(
         )
 
     answer = _tidy_answer(answer)
-    citations = retrieval.build_citations(passages)
-    _save_answer(session_id, answer, citations)
-    _log_query(username, question, doc_id, best_score, answered=True)
+    _save_answer(session_id, answer, plan.citations)
+    _log_query(username, question, doc_id, plan.best_score, answered=True)
 
     return {
         "answer": answer,
         "sources_used": True,
-        "citations": citations,
+        "citations": plan.citations,
         "grounded": True,
-        "graph_used": bool(graph_text),
+        "graph_used": bool(plan.graph_text),
         "elapsed_seconds": round(time.perf_counter() - started, 2),
     }
+
+
+# --- Streaming ---------------------------------------------------------------
+def _sse(payload: dict) -> str:
+    """One server-sent event. A single JSON object per frame keeps the client
+    parser trivial and avoids a second dimension of event-name handling."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _stream_answer(
+    session_id: str,
+    doc_id: Optional[str],
+    question: str,
+    username: str,
+    started: float,
+):
+    """Generate an answer as a stream of server-sent events.
+
+    Why this exists: retrieval alone is two LLM calls and four vector searches,
+    and generation is several seconds more. Buffering all of it meant the user
+    watched a spinner for the entire time with no evidence anything was
+    happening. Streaming does not make it faster - it makes the first useful
+    output arrive in about a second instead of at the end.
+
+    Citations are sent *before* the tokens, because they are known as soon as
+    retrieval finishes and they let the UI render the sources while the prose
+    is still arriving.
+
+    Errors are emitted as a final event rather than raised: the response status
+    is already 200 by the time generation starts, so an exception here would
+    otherwise truncate the body with no explanation.
+    """
+    try:
+        yield _sse({"type": "status", "stage": "searching"})
+
+        plan = _plan_answer(session_id, doc_id, question)
+
+        if plan.abstain:
+            answer = NO_CONTEXT_ANSWER.format(scope=plan.scope)
+            _save_answer(session_id, answer, [])
+            _log_query(username, question, doc_id, plan.best_score, answered=False)
+            yield _sse({"type": "token", "text": answer})
+            yield _sse({
+                "type": "done",
+                "answer": answer,
+                "citations": [],
+                "grounded": False,
+                "sources_used": False,
+                "graph_used": False,
+                "elapsed_seconds": round(time.perf_counter() - started, 2),
+            })
+            return
+
+        yield _sse({"type": "citations", "citations": plan.citations})
+        yield _sse({"type": "status", "stage": "writing"})
+
+        chunks = []
+        try:
+            chain = chat_prompt | smart_llm | StrOutputParser()
+            for piece in chain.stream({**plan.prompt_inputs, "question": question}):
+                if not piece:
+                    continue
+                chunks.append(piece)
+                yield _sse({"type": "token", "text": piece})
+        except Exception:
+            logger.exception("Streamed answer generation failed")
+            yield _sse({
+                "type": "error",
+                "detail": "Every language model provider is currently unavailable. "
+                          "Please try again shortly.",
+            })
+            return
+
+        # Tidying is whole-text work - moving a citation across a full stop
+        # cannot be done a token at a time - so the client replaces its
+        # accumulated draft with this final version.
+        answer = _tidy_answer("".join(chunks))
+        _save_answer(session_id, answer, plan.citations)
+        _log_query(username, question, doc_id, plan.best_score, answered=True)
+
+        yield _sse({
+            "type": "done",
+            "answer": answer,
+            "citations": plan.citations,
+            "grounded": True,
+            "sources_used": True,
+            "graph_used": bool(plan.graph_text),
+            "elapsed_seconds": round(time.perf_counter() - started, 2),
+        })
+    except Exception:
+        logger.exception("Chat stream failed")
+        yield _sse({"type": "error", "detail": "Something went wrong generating that answer."})
 
 
 def _enforce_chat_limit(http_request: Request, username: str) -> None:
@@ -699,6 +836,60 @@ def chat_with_archive(
         _autotitle_session(session_id, question)
 
     return _answer_question(session_id, doc_id, question, user.username, started)
+
+
+@router.post("/chat/stream")
+def chat_with_archive_streamed(
+    request: ChatRequest,
+    http_request: Request,
+    user: CurrentUser = Depends(get_current_user),
+):
+    """The same answer as POST /api/chat, delivered as it is written.
+
+    `/api/chat` is kept and still works. Two consumers justify that: the edit
+    flow, which replaces a whole turn and has nothing useful to show
+    progressively, and any client that cannot read a stream.
+    """
+    _enforce_chat_limit(http_request, user.username)
+    question = request.message.strip()
+    session_id = request.session_id
+    started = time.perf_counter()
+
+    with neo4j_driver.session() as session:
+        doc_id = _session_doc_id(session, session_id, user.username)
+
+        session.run(
+            """
+            MATCH (s:ChatSession {id: $session_id})
+            CREATE (s)-[:HAS_MESSAGE]->(m:Message {
+                id: $id, role: 'user', content: $content, timestamp: $ts
+            })
+            """,
+            session_id=session_id, id=str(uuid.uuid4()),
+            content=question, ts=int(time.time() * 1000),
+        )
+
+        existing = session.run(
+            "MATCH (s:ChatSession {id: $session_id})-[:HAS_MESSAGE]->(m:Message) "
+            "RETURN count(m) AS n",
+            session_id=session_id,
+        ).single()
+
+    if existing and existing["n"] <= 1:
+        _autotitle_session(session_id, question)
+
+    return StreamingResponse(
+        _stream_answer(session_id, doc_id, question, user.username, started),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Nginx buffers proxied responses by default, which would hold the
+            # whole stream and deliver it at once - the exact behaviour this
+            # endpoint exists to avoid.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/chat/edit")

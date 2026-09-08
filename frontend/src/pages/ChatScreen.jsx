@@ -7,7 +7,7 @@ import {
 
 import {
   createSession, deleteSession, editMessage, errorMessage, fetchHistory,
-  fetchSessions, renameSession, sendMessage,
+  fetchSessions, renameSession, streamMessage,
 } from '../api';
 import { ChatMessage, NewChatModal, EmptyState, Spinner } from '../components/common';
 
@@ -123,6 +123,7 @@ const ChatScreen = ({
   const [showNewChatModal, setShowNewChatModal] = useState(false);
   const [showPromptHistory, setShowPromptHistory] = useState(false);
   const [briefOpen, setBriefOpen] = useState(true);
+  const [stage, setStage] = useState('');
 
   const editInputRef = useRef(null);
   const messagesEndRef = useRef(null);
@@ -220,29 +221,61 @@ const ChatScreen = ({
     setMessages((prev) => [...prev, { role: 'user', content: text }]);
     setInput('');
     setLoading(true);
+    setStage('searching');
     setError('');
 
+    // The placeholder the tokens stream into. Appending it up front means the
+    // answer grows in place rather than appearing all at once at the end.
+    let streamed = '';
+    setMessages((prev) => [
+      ...prev,
+      { role: 'ai', content: '', citations: [], streaming: true },
+    ]);
+
+    const patchLast = (patch) =>
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next.length - 1;
+        if (last >= 0 && next[last].role === 'ai') {
+          next[last] = { ...next[last], ...patch };
+        }
+        return next;
+      });
+
     try {
-      const data = await sendMessage(text, activeSessionId);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'ai',
-          content: data.answer,
-          citations: data.citations,
-          grounded: data.grounded,
+      await streamMessage(text, activeSessionId, {
+        onStatus: setStage,
+        // Citations arrive before the prose, so the sources render while the
+        // answer is still being written.
+        onCitations: (citations) => patchLast({ citations }),
+        onToken: (piece) => {
+          streamed += piece;
+          patchLast({ content: streamed });
         },
-      ]);
+        onDone: (payload) =>
+          patchLast({
+            // The server's final text, not the accumulated draft: citation
+            // tidying is whole-text work and cannot be done token by token.
+            content: payload.answer,
+            citations: payload.citations,
+            grounded: payload.grounded,
+            streaming: false,
+          }),
+      });
+
       // Re-read the transcript so the new messages carry their server ids,
       // which is what makes them editable.
       fetchHistory(activeSessionId).then(setMessages).catch(() => {});
       // The first message renames the session server-side, so refresh the list.
       if (wasEmpty) fetchSessions().then(setSessions).catch(() => {});
     } catch (err) {
+      // Drop the placeholder and the question, and hand the text back so it is
+      // not lost.
+      setMessages((prev) => prev.slice(0, -2));
       setError(errorMessage(err, 'That answer could not be generated.'));
-      setMessages((prev) => prev.slice(0, -1));
       setInput(text);
     }
+    setStage('');
     setLoading(false);
   };
 
@@ -446,10 +479,12 @@ const ChatScreen = ({
             />
           ))}
 
-          {loading && (
+          {loading && !messages.some((m) => m.streaming && m.content) && (
             <div className="text-sky-500 font-medium flex items-center gap-2 bg-white dark:bg-slate-700 w-fit px-4 py-3 rounded-2xl rounded-tl-sm border border-slate-200 dark:border-slate-600 shadow-sm">
               <Spinner size={14} />
-              <span className="text-sm">Searching the archive</span>
+              <span className="text-sm">
+                {stage === 'writing' ? 'Writing the answer' : 'Searching the archive'}
+              </span>
             </div>
           )}
 
