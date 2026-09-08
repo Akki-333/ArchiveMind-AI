@@ -240,6 +240,8 @@ and one LLM key are required; every other variable has a working default.
 | Retrieval | `RETRIEVAL_FINAL_K`, `RETRIEVAL_BROAD_K`, `RETRIEVAL_MIN_SCORE`, `RETRIEVAL_RELATIVE_FLOOR`, `ABSTAIN_THRESHOLD`, `MULTI_QUERY_ENABLED`, `LEXICAL_SEARCH_ENABLED` |
 | Ingestion | `MAX_UPLOAD_MB`, `MAX_DOCUMENTS_PER_USER`, `CHUNK_SIZE`, `CHUNK_OVERLAP` |
 | Graph | `GRAPH_CACHE_ENABLED`, `GRAPH_NEIGHBOURHOOD_HOPS`, `GRAPH_MAX_NODES` |
+| Rate limits | `CHAT_RATE_LIMIT`/`_WINDOW`, `UPLOAD_RATE_*`, `GRAPH_RATE_*`, `COMPARE_RATE_*` — set any limit to `0` to disable it |
+| Operations | `HEALTH_CACHE_SECONDS`, `QUERY_LOG_RETENTION_DAYS` |
 
 **Model ids are configuration, not code.** Providers retire them periodically.
 When that happens the fallback chain keeps the app answering, and the fix is an
@@ -310,21 +312,56 @@ ArchiveMind-AI/
 │   ├── llm.py           provider chain with failover
 │   ├── database.py      Pinecone, Neo4j, embeddings, health
 │   ├── schema.py        constraints and indexes, applied on boot
-│   ├── auth.py          JWT, roles, throttling
+│   ├── auth.py          JWT, roles, throttling, profiles
+│   ├── ratelimit.py     bounded sliding-window limiter
 │   ├── retrieval.py     the five-stage pipeline
 │   ├── graph_store.py   entity resolution, persistence, traversal
 │   ├── ingestion.py     parse, chunk, embed, profile
-│   ├── querying.py      chat, sessions, comparison, analytics
 │   ├── graph_api.py     graph endpoints
+│   ├── querying.py      assembles the routers below
+│   ├── routers/
+│   │   ├── prompts.py   grounding rules, citation format, abstain path
+│   │   ├── shared.py    request models and cross-router helpers
+│   │   ├── documents.py the archive: list and remove
+│   │   ├── sessions.py  conversations and transcripts
+│   │   ├── chat.py      answering, buffered and streamed
+│   │   ├── compare.py   structured comparison
+│   │   └── analytics.py stats, recommendations, coverage
+│   ├── tests/           pytest, no network access
 │   └── main.py          app wiring, health, error handling
 ├── frontend/src/
-│   ├── api.js           all HTTP
-│   ├── lib/graph.js     layout and palette
-│   ├── components/      shared UI
-│   ├── pages/           screens
-│   └── App.jsx          layout and routing
+│   ├── api.js           all HTTP, including the SSE chat stream
+│   ├── lib/graph.js     layout, palette, crossing reduction (+ tests)
+│   ├── components/      Answer, CodeBlock, shared UI
+│   ├── pages/           one module per screen, lazily loaded
+│   └── App.jsx          layout, routing, code splitting
+├── .github/workflows/   CI: tests, lint, build, route contract
 └── Dockerfile           container image for Hugging Face Spaces
 ```
+
+---
+
+## Tests
+
+```bash
+pip install -r backend/requirements-dev.txt
+pytest backend/tests -q          # 114 tests
+
+cd frontend && npm test          # 21 tests
+```
+
+Neither suite touches a network service. `backend/tests/conftest.py` sets
+synthetic credentials before any module is imported, and `python-dotenv` does
+not override variables that are already set, so the tests can never reach your
+real Pinecone index or Neo4j instance.
+
+The suites deliberately target the functions where a regression is *silent* —
+the relevance floor, entity resolution, citation tidying, graph layout. Nothing
+crashes when those break; answers and diagrams just quietly get worse.
+
+CI additionally runs an import smoke test asserting that the core routes still
+register and that `/health/db` and `/health/config` still require an
+administrator.
 
 ---
 
