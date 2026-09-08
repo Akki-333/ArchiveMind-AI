@@ -22,7 +22,7 @@ from typing import List, Tuple
 
 import docx
 import PyPDF2
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from langchain_core.documents import Document
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -32,6 +32,7 @@ from pptx import Presentation
 
 import config
 import graph_store
+import ratelimit
 from auth import CurrentUser, require_admin
 from database import get_embeddings, index_name, neo4j_driver
 from llm import fast_llm, smart_llm
@@ -194,12 +195,49 @@ def save_to_neo4j(nodes, edges, doc_id, chunk_ids=None):
 
 
 # --- Route -------------------------------------------------------------------
+def _read_capped(upload: UploadFile, limit: int) -> bytes:
+    """Read at most `limit` bytes, refusing anything larger.
+
+    The previous version did `file.file.read()` and *then* compared the length
+    against the cap - so a 2 GB body was fully materialised in memory before
+    being rejected, and the size limit protected the index while leaving RAM
+    wide open. Reading in bounded chunks and stopping one byte past the limit
+    means an oversized upload costs the limit, not the payload.
+    """
+    chunks = []
+    total = 0
+    while True:
+        chunk = upload.file.read(1_048_576)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"That file is larger than the {config.MAX_UPLOAD_MB} MB limit.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/upload")
 def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     user: CurrentUser = Depends(require_admin),
 ):
     """Ingest a document. Administrators only - this writes to a shared archive."""
+    # Ingestion is the most expensive thing the app does: parsing, embedding
+    # every chunk, and an LLM profiling call. Admin-only is an authorisation
+    # control, not a cost control, so it also gets a rate limit.
+    ratelimit.enforce(
+        "upload",
+        ratelimit.client_key(request, user.username),
+        config.UPLOAD_RATE_LIMIT,
+        config.UPLOAD_RATE_WINDOW,
+        message="You are uploading too quickly.",
+    )
+
     filename = (file.filename or "").strip()
     if not filename or "." not in filename:
         raise HTTPException(status_code=400, detail="The file needs a name with an extension.")
@@ -212,14 +250,16 @@ def upload_document(
             detail=f"Unsupported format '.{ext}'. Allowed: {allowed}.",
         )
 
-    # Sync route, so read the underlying spooled file directly.
-    contents = file.file.read()
-    if len(contents) > config.MAX_UPLOAD_BYTES:
-        size_mb = len(contents) / 1_048_576
+    # Reject on the declared length before reading a byte, when the client is
+    # honest enough to send one. `_read_capped` handles the case where it lies.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > config.MAX_UPLOAD_BYTES * 1.05:
         raise HTTPException(
             status_code=413,
-            detail=f"That file is {size_mb:.1f} MB. The limit is {config.MAX_UPLOAD_MB} MB.",
+            detail=f"That upload is larger than the {config.MAX_UPLOAD_MB} MB limit.",
         )
+
+    contents = _read_capped(file, config.MAX_UPLOAD_BYTES)
     if not contents:
         raise HTTPException(status_code=400, detail="That file is empty.")
 

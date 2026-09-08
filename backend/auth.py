@@ -27,7 +27,6 @@ import re
 import secrets
 import time
 import uuid
-from collections import defaultdict
 from typing import Optional
 
 import bcrypt
@@ -37,6 +36,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 import config
+import ratelimit
 from database import neo4j_driver
 
 logger = logging.getLogger("archivemind.auth")
@@ -149,9 +149,16 @@ def validate_username(username: str) -> str:
 
 
 # --- Login throttling --------------------------------------------------------
-# In-memory sliding window, which matches the single-process deployment. A
-# multi-worker setup would move this to Redis.
-_login_attempts: dict = defaultdict(list)
+# Backed by the shared sliding-window store. The dict this replaced only ever
+# shrank on a *successful* sign-in, so a stream of failures against varying
+# usernames grew it without bound - slow memory exhaustion driven from an
+# unauthenticated endpoint. `ratelimit` prunes expired windows and caps the
+# number of tracked keys.
+#
+# The semantics are unusual enough to keep as three separate calls: a *failed*
+# attempt counts against you, the act of trying does not, so the check and the
+# record happen at different points in the handler.
+_LOGIN_BUCKET = "login"
 
 
 def _throttle_key(request: Request, username: str) -> str:
@@ -161,24 +168,24 @@ def _throttle_key(request: Request, username: str) -> str:
 
 def check_login_rate(request: Request, username: str) -> None:
     key = _throttle_key(request, username)
-    now = time.time()
-    window_start = now - config.LOGIN_WINDOW_SECONDS
-    attempts = [t for t in _login_attempts[key] if t > window_start]
-    _login_attempts[key] = attempts
-    if len(attempts) >= config.LOGIN_MAX_ATTEMPTS:
-        retry_in = int(attempts[0] + config.LOGIN_WINDOW_SECONDS - now)
+    attempts = ratelimit.peek(_LOGIN_BUCKET, key, config.LOGIN_WINDOW_SECONDS)
+    if attempts >= config.LOGIN_MAX_ATTEMPTS:
+        retry_in = ratelimit.retry_after(_LOGIN_BUCKET, key, config.LOGIN_WINDOW_SECONDS)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Too many sign-in attempts. Try again in {max(retry_in, 1)} seconds.",
+            detail=f"Too many sign-in attempts. Try again in {retry_in} seconds.",
+            headers={"Retry-After": str(retry_in)},
         )
 
 
 def record_failed_login(request: Request, username: str) -> None:
-    _login_attempts[_throttle_key(request, username)].append(time.time())
+    ratelimit.record(
+        _LOGIN_BUCKET, _throttle_key(request, username), config.LOGIN_WINDOW_SECONDS
+    )
 
 
 def clear_login_attempts(request: Request, username: str) -> None:
-    _login_attempts.pop(_throttle_key(request, username), None)
+    ratelimit.clear(_LOGIN_BUCKET, _throttle_key(request, username))
 
 
 # --- Tokens ------------------------------------------------------------------

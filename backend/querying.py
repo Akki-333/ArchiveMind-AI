@@ -18,13 +18,14 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 import config
 import graph_store
+import ratelimit
 import retrieval
 from auth import CurrentUser, get_current_user, require_admin
 from database import index_name, neo4j_driver, pc
@@ -251,6 +252,52 @@ def _document_name(doc_id: Optional[str]) -> str:
             doc_id=doc_id,
         ).single()
     return record["filename"] if record and record["filename"] else "the archive"
+
+
+_last_prune_at = 0.0
+_PRUNE_INTERVAL_SECONDS = 86_400
+
+
+def prune_query_log(force: bool = False) -> int:
+    """Delete query-log rows older than the retention window.
+
+    These rows are a record of what citizens asked a government service. They
+    earn their place - an unanswered question is the clearest signal of which
+    document to ingest next - but that is a reason to keep them for a while,
+    not forever. Called on boot and at most daily from the analytics routes,
+    so no scheduler is needed.
+
+    Returns the number of rows deleted.
+    """
+    global _last_prune_at
+    days = config.QUERY_LOG_RETENTION_DAYS
+    if days <= 0:
+        return 0
+
+    now = time.time()
+    if not force and now - _last_prune_at < _PRUNE_INTERVAL_SECONDS:
+        return 0
+    _last_prune_at = now
+
+    cutoff = int((now - days * 86_400) * 1000)
+    try:
+        with neo4j_driver.session() as session:
+            record = session.run(
+                """
+                MATCH (q:QueryLog) WHERE q.created_at < $cutoff
+                WITH q LIMIT 20000
+                DETACH DELETE q
+                RETURN count(*) AS deleted
+                """,
+                cutoff=cutoff,
+            ).single()
+        deleted = (record["deleted"] if record else 0) or 0
+        if deleted:
+            logger.info("Pruned %d query-log entries older than %d days.", deleted, days)
+        return deleted
+    except Exception as exc:
+        logger.warning("Query-log pruning failed: %s", exc)
+        return 0
 
 
 def _log_query(username: str, question: str, doc_id: Optional[str],
@@ -604,8 +651,26 @@ def _answer_question(
     }
 
 
+def _enforce_chat_limit(http_request: Request, username: str) -> None:
+    """Answering costs three or four LLM calls. Without a limit one account can
+    drain a free-tier quota in minutes, and when it is gone every *other* user
+    gets a 503 - so this protects the other users, not the server."""
+    ratelimit.enforce(
+        "chat",
+        ratelimit.client_key(http_request, username),
+        config.CHAT_RATE_LIMIT,
+        config.CHAT_RATE_WINDOW,
+        message="You are sending messages too quickly.",
+    )
+
+
 @router.post("/chat")
-def chat_with_archive(request: ChatRequest, user: CurrentUser = Depends(get_current_user)):
+def chat_with_archive(
+    request: ChatRequest,
+    http_request: Request,
+    user: CurrentUser = Depends(get_current_user),
+):
+    _enforce_chat_limit(http_request, user.username)
     question = request.message.strip()
     session_id = request.session_id
     started = time.perf_counter()
@@ -638,7 +703,9 @@ def chat_with_archive(request: ChatRequest, user: CurrentUser = Depends(get_curr
 
 @router.post("/chat/edit")
 def edit_and_regenerate(
-    request: ChatEditRequest, user: CurrentUser = Depends(get_current_user)
+    request: ChatEditRequest,
+    http_request: Request,
+    user: CurrentUser = Depends(get_current_user),
 ):
     """Rewrite a question already asked, and answer the new one.
 
@@ -647,6 +714,7 @@ def edit_and_regenerate(
     responded to a question that was never asked, and keeping the later turns
     would leave follow-ups attached to an answer that no longer exists.
     """
+    _enforce_chat_limit(http_request, user.username)
     question = request.message.strip()
     if not question:
         raise HTTPException(status_code=400, detail="The edited question cannot be empty.")
@@ -743,13 +811,27 @@ def _save_answer(session_id: str, answer: str, citations: List[dict]) -> None:
 
 # --- Document comparison -----------------------------------------------------
 @router.post("/documents/compare")
-def compare_documents(request: CompareRequest, user: CurrentUser = Depends(get_current_user)):
+def compare_documents(
+    request: CompareRequest,
+    http_request: Request,
+    user: CurrentUser = Depends(get_current_user),
+):
     """Structured comparison across documents.
 
     This is the capability the architecture makes possible that a plain
     chat-with-PDF tool cannot do, and overlapping government schemes are
     exactly the case it serves.
     """
+    # A comparison retrieves against every selected document and then runs a
+    # long generation, so it is several times the cost of one chat message.
+    ratelimit.enforce(
+        "compare",
+        ratelimit.client_key(http_request, user.username),
+        config.COMPARE_RATE_LIMIT,
+        config.COMPARE_RATE_WINDOW,
+        message="You are running comparisons too quickly.",
+    )
+
     doc_ids = [d for d in request.doc_ids if d][:3]
     if len(doc_ids) < 2:
         raise HTTPException(status_code=400, detail="Choose at least two documents to compare.")
@@ -974,6 +1056,8 @@ def coverage_report(_: CurrentUser = Depends(require_admin)):
     add. Presenting it as demand rather than as failure is not spin; it is the
     framing that leads to the action the data actually supports.
     """
+    prune_query_log()
+
     now_ms = int(time.time() * 1000)
     week_ago = now_ms - 7 * 86_400_000
 

@@ -13,10 +13,12 @@ import logging
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
+import config
 import graph_store
+import ratelimit
 import retrieval
 from auth import CurrentUser, get_current_user
 from database import neo4j_driver
@@ -108,9 +110,21 @@ def get_document_graph(
 @router.post("/highlight")
 def highlight_graph(
     request: HighlightRequest,
+    http_request: Request,
     user: CurrentUser = Depends(get_current_user),
 ):
     """Extract the graph for one question, persist it, and return it."""
+    # An uncached extraction is a retrieval pass plus a full LLM call. The cache
+    # absorbs repeats, but `refresh: true` bypasses it by design - so the button
+    # that rebuilds the graph is exactly the one that needs a limit.
+    ratelimit.enforce(
+        "graph",
+        ratelimit.client_key(http_request, user.username),
+        config.GRAPH_RATE_LIMIT,
+        config.GRAPH_RATE_WINDOW,
+        message="You are rebuilding the graph too quickly.",
+    )
+
     query = request.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Ask something first.")
