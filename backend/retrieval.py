@@ -23,6 +23,7 @@ still attached, which is what makes citations possible downstream.
 """
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
@@ -169,6 +170,15 @@ def expand_query(query: str) -> List[str]:
     variants = [query]
     if not config.MULTI_QUERY_ENABLED or config.MULTI_QUERY_COUNT < 1:
         return variants
+
+    # Expansion buys recall by trading a round-trip. On a short keyword query
+    # there is nothing to buy: "Article 46" has no vocabulary to mismatch on,
+    # the lexical half matches it exactly, and paraphrasing a proper noun
+    # mostly produces noise. Skipping those removes an LLM call from the
+    # critical path of the queries that were already quickest to answer.
+    if len(query.split()) <= 3:
+        logger.debug("Short query; skipping expansion.")
+        return variants
     try:
         chain = _EXPAND_PROMPT | fast_llm | StrOutputParser()
         raw = chain.invoke({"query": query, "count": config.MULTI_QUERY_COUNT})
@@ -311,28 +321,47 @@ def reciprocal_rank_fusion(result_lists: Sequence[List[Passage]]) -> List[Passag
     return sorted(fused.values(), key=lambda p: p.score, reverse=True)
 
 
-def mmr_select(query: str, passages: List[Passage], k: int, lambda_: float) -> List[Passage]:
-    """Maximal marginal relevance: relevant, but not three copies of one thing."""
-    if len(passages) <= k:
-        return passages
+def _normalise(matrix):
+    denom = np.linalg.norm(matrix, axis=-1, keepdims=True)
+    return matrix / np.clip(denom, 1e-9, None)
 
-    embedder = get_embeddings()
+
+def embed_for_ranking(query: str, passages: List[Passage]):
+    """Embed the query and every passage once, normalised.
+
+    Both MMR and the relevance floor need exactly this, and each used to compute
+    it independently - two `embed_query` calls and two `embed_documents` passes
+    over overlapping text on every single message. Embedding is the most
+    expensive local step in the pipeline, so doing it once and sharing the
+    result is the largest saving available without changing behaviour.
+
+    Returns `(query_vec, doc_vecs)` or `None` if the model is unavailable, in
+    which case callers fall back to their previous rank-only behaviour.
+    """
+    if not passages:
+        return None
     try:
+        embedder = get_embeddings()
         query_vec = np.asarray(embedder.embed_query(query), dtype=np.float32)
         doc_vecs = np.asarray(
             embedder.embed_documents([p.text[:1200] for p in passages]), dtype=np.float32
         )
     except Exception as exc:
-        logger.warning("MMR embedding failed, falling back to plain ranking: %s", exc)
-        return passages[:k]
+        logger.warning("Embedding for ranking failed: %s", exc)
+        return None
+    return _normalise(query_vec.reshape(1, -1))[0], _normalise(doc_vecs)
 
-    def _norm(matrix):
-        denom = np.linalg.norm(matrix, axis=-1, keepdims=True)
-        return matrix / np.clip(denom, 1e-9, None)
 
-    query_vec = _norm(query_vec.reshape(1, -1))[0]
-    doc_vecs = _norm(doc_vecs)
+def mmr_select_indices(passages: List[Passage], k: int, lambda_: float, vectors) -> List[int]:
+    """Maximal marginal relevance, returning positions rather than passages.
 
+    Positions let the caller reuse the already-computed embeddings for the
+    selected subset instead of embedding them a second time.
+    """
+    if vectors is None or len(passages) <= k:
+        return list(range(min(k, len(passages))))
+
+    query_vec, doc_vecs = vectors
     relevance = doc_vecs @ query_vec
     selected: List[int] = []
     remaining = list(range(len(passages)))
@@ -351,7 +380,21 @@ def mmr_select(query: str, passages: List[Passage], k: int, lambda_: float) -> L
         selected.append(best)
         remaining.remove(best)
 
-    return [passages[i] for i in selected]
+    return selected
+
+
+def mmr_select(query: str, passages: List[Passage], k: int, lambda_: float) -> List[Passage]:
+    """Maximal marginal relevance: relevant, but not three copies of one thing.
+
+    Kept as the standalone entry point. `retrieve` uses the index form so it can
+    share one embedding pass with the relevance floor.
+    """
+    if len(passages) <= k:
+        return passages
+    vectors = embed_for_ranking(query, passages)
+    if vectors is None:
+        return passages[:k]
+    return [passages[i] for i in mmr_select_indices(passages, k, lambda_, vectors)]
 
 
 # --- Orchestration -----------------------------------------------------------
@@ -429,14 +472,37 @@ def retrieve(
     variants = expand_query(search_query)
 
     per_variant = max(config.RETRIEVAL_CANDIDATES // max(len(variants), 1), 6)
+
+    # The searches are independent network calls, so running them one after
+    # another simply added their latencies together: four variants against
+    # Pinecone plus the Neo4j full-text query was five sequential round-trips
+    # before the answer could even begin. They now overlap, and the slowest one
+    # sets the cost rather than the sum.
     result_lists: List[List[Passage]] = []
+    lexical: List[Passage] = []
 
-    for variant in variants:
-        dense = dense_search(variant, doc_id, per_variant)
-        if dense:
-            result_lists.append(dense)
+    with ThreadPoolExecutor(max_workers=min(len(variants) + 1, 6)) as pool:
+        dense_futures = [
+            pool.submit(dense_search, variant, doc_id, per_variant) for variant in variants
+        ]
+        lexical_future = pool.submit(
+            lexical_search, search_query, doc_id, config.RETRIEVAL_CANDIDATES
+        )
 
-    lexical = lexical_search(search_query, doc_id, config.RETRIEVAL_CANDIDATES)
+        for future in dense_futures:
+            try:
+                dense = future.result()
+            except Exception as exc:
+                logger.warning("A dense search failed: %s", exc)
+                continue
+            if dense:
+                result_lists.append(dense)
+
+        try:
+            lexical = lexical_future.result() or []
+        except Exception as exc:
+            logger.warning("Lexical search failed: %s", exc)
+
     if lexical:
         result_lists.append(lexical)
 
@@ -445,8 +511,20 @@ def retrieve(
 
     lexical_ids = {p.chunk_id for p in lexical}
     fused = reciprocal_rank_fusion(result_lists)[: config.RETRIEVAL_CANDIDATES]
-    selected = mmr_select(search_query, fused, final_k, config.RETRIEVAL_MMR_LAMBDA)
-    return _apply_relevance_floor(search_query, selected, lexical_ids, broad=broad)
+
+    # One embedding pass, shared by the diversity step and the floor.
+    vectors = embed_for_ranking(search_query, fused)
+    chosen = mmr_select_indices(fused, final_k, config.RETRIEVAL_MMR_LAMBDA, vectors)
+    selected = [fused[i] for i in chosen]
+
+    similarities = None
+    if vectors is not None and chosen:
+        query_vec, doc_vecs = vectors
+        similarities = doc_vecs[chosen] @ query_vec
+
+    return _apply_relevance_floor(
+        search_query, selected, lexical_ids, broad=broad, similarities=similarities
+    )
 
 
 def _apply_relevance_floor(
@@ -454,6 +532,7 @@ def _apply_relevance_floor(
     passages: List[Passage],
     lexical_ids: Optional[set] = None,
     broad: bool = False,
+    similarities=None,
 ) -> List[Passage]:
     """Score against the real query and drop the passages that are genuinely off-topic.
 
@@ -472,17 +551,16 @@ def _apply_relevance_floor(
     if not passages:
         return []
     lexical_ids = lexical_ids or set()
-    try:
-        embedder = get_embeddings()
-        query_vec = np.asarray(embedder.embed_query(query), dtype=np.float32)
-        doc_vecs = np.asarray(
-            embedder.embed_documents([p.text[:1200] for p in passages]), dtype=np.float32
-        )
-        query_vec = query_vec / max(float(np.linalg.norm(query_vec)), 1e-9)
-        doc_vecs = doc_vecs / np.clip(np.linalg.norm(doc_vecs, axis=1, keepdims=True), 1e-9, None)
+
+    # `retrieve` passes these in, having already embedded the candidates for
+    # MMR. Computing them again here was a second full embedding pass over
+    # overlapping text on every message.
+    if similarities is None:
+        vectors = embed_for_ranking(query, passages)
+        if vectors is None:
+            return passages
+        query_vec, doc_vecs = vectors
         similarities = doc_vecs @ query_vec
-    except Exception:
-        return passages
 
     for passage, similarity in zip(passages, similarities):
         passage.score = float(similarity)

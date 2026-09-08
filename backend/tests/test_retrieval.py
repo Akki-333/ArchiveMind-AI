@@ -208,6 +208,103 @@ def test_floor_on_empty_input_returns_empty(fake_embeddings):
     assert retrieval._apply_relevance_floor("query", []) == []
 
 
+# --- shared embeddings and diversity ----------------------------------------
+def test_the_floor_uses_precomputed_similarities_without_re_embedding(monkeypatch):
+    """The latency fix. `retrieve` embeds the candidates once for MMR and hands
+    the result to the floor; embedding again here was a second full pass over
+    overlapping text on every message."""
+    calls = {"n": 0}
+
+    def _tripwire():
+        calls["n"] += 1
+        raise AssertionError("the floor must not embed when given similarities")
+
+    monkeypatch.setattr(retrieval, "get_embeddings", _tripwire)
+
+    import numpy as np
+
+    passages = [_passage("a", text="a"), _passage("b", text="b")]
+    kept = retrieval._apply_relevance_floor(
+        "query", passages, similarities=np.array([0.9, 0.8], dtype="float32")
+    )
+
+    assert calls["n"] == 0
+    assert {p.chunk_id for p in kept} == {"a", "b"}
+    assert kept[0].score == pytest.approx(0.9, abs=1e-6)
+
+
+def test_lambda_trades_relevance_against_diversity(fake_embeddings):
+    """What MMR actually guarantees.
+
+    "b" is nearly a duplicate of "a" but scores much higher than "c", so which
+    one is picked second is a genuine trade-off, not a fixed answer. A high
+    lambda weights relevance and takes the near-duplicate; a low one weights
+    novelty and takes the passage that adds something. Asserting one fixed
+    outcome would pin an arbitrary point on that curve.
+    """
+    vectors = {
+        "query": [1.0, 0.0],
+        "near-duplicate A": [0.99, 0.141],
+        "near-duplicate B": [0.98, 0.199],
+        "different angle": [0.60, 0.800],
+    }
+    fake_embeddings(vectors)
+
+    passages = [
+        _passage("a", text="near-duplicate A"),
+        _passage("b", text="near-duplicate B"),
+        _passage("c", text="different angle"),
+    ]
+
+    relevance_heavy = {p.chunk_id for p in
+                       retrieval.mmr_select("query", passages, k=2, lambda_=0.9)}
+    diversity_heavy = {p.chunk_id for p in
+                       retrieval.mmr_select("query", passages, k=2, lambda_=0.3)}
+
+    # The most relevant passage is taken first either way.
+    assert "a" in relevance_heavy and "a" in diversity_heavy
+    assert relevance_heavy == {"a", "b"}
+    assert diversity_heavy == {"a", "c"}
+
+
+def test_mmr_returns_everything_when_k_exceeds_the_candidates():
+    passages = [_passage("a"), _passage("b")]
+    assert retrieval.mmr_select("q", passages, k=5, lambda_=0.7) == passages
+
+
+def test_mmr_degrades_to_plain_ranking_without_a_model(monkeypatch):
+    """An embedding failure must cost diversity, not the whole answer."""
+    monkeypatch.setattr(
+        retrieval, "get_embeddings",
+        lambda: (_ for _ in ()).throw(RuntimeError("model unavailable")),
+    )
+    passages = [_passage(str(i)) for i in range(5)]
+    selected = retrieval.mmr_select("q", passages, k=2, lambda_=0.7)
+
+    assert [p.chunk_id for p in selected] == ["0", "1"]
+
+
+# --- expansion ---------------------------------------------------------------
+def test_short_queries_skip_expansion(monkeypatch):
+    """A keyword query has no vocabulary to mismatch on, and the lexical half
+    already matches it exactly - so the extra LLM call buys nothing."""
+    monkeypatch.setattr(
+        retrieval, "fast_llm",
+        property(lambda self: (_ for _ in ()).throw(AssertionError("must not call the LLM"))),
+        raising=False,
+    )
+    assert retrieval.expand_query("Article 46") == ["Article 46"]
+    assert retrieval.expand_query("MSME TEAM eligibility") == ["MSME TEAM eligibility"]
+
+
+def test_expansion_is_disabled_by_configuration(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "MULTI_QUERY_ENABLED", False)
+    query = "a longer question about eligibility criteria for the scheme"
+    assert retrieval.expand_query(query) == [query]
+
+
 # --- formatting --------------------------------------------------------------
 def test_format_context_numbers_passages_from_one():
     passages = [
