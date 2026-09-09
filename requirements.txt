@@ -1,0 +1,40 @@
+gradio>=4.0.0
+
+# --- Web framework ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+
+# --- Auth ---
+bcrypt>=4.1.0
+PyJWT>=2.8.0
+
+# --- LangChain core ---
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-text-splitters>=0.2.0
+
+# --- Embeddings (local, free, 384-dim) ---
+langchain-huggingface>=0.0.3
+sentence-transformers>=2.7.0
+
+# --- Stores ---
+langchain-pinecone>=0.1.0
+pinecone>=5.0.0
+neo4j>=5.20.0
+
+# --- LLM providers ---
+langchain-groq>=0.1.5
+langchain-google-genai>=1.0.0
+langchain-openai>=0.1.7
+
+# --- Document parsing ---
+pypdf>=4.2.0
+PyPDF2>=3.0.1
+python-docx>=1.1.0
+python-pptx>=0.6.23
+
+# --- Numerics ---
+numpy>=1.26.0
