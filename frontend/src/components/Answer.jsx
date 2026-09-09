@@ -91,7 +91,6 @@ export const Mermaid = ({ code, darkMode }) => {
 
   return (
     <div className="not-prose my-5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900/60 p-4 overflow-x-auto custom-scrollbar">
-      {/* eslint-disable-next-line react/no-danger */}
       <div
         className="flex justify-center [&_svg]:max-w-full [&_svg]:h-auto"
         dangerouslySetInnerHTML={{ __html: svg }}

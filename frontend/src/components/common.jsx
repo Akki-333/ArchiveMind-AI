@@ -936,8 +936,23 @@ export const AccessRequestBell = ({ onHandled }) => {
 
   const count = requests.length;
 
+  const formatRequestedDate = (ts) => {
+    if (!ts) return 'Recently';
+    try {
+      const d = new Date(ts);
+      return d.toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return 'Recently';
+    }
+  };
+
   return (
-    <div className="relative">
+    <>
       <button
         onClick={() => setOpen((v) => !v)}
         title={
@@ -945,11 +960,11 @@ export const AccessRequestBell = ({ onHandled }) => {
             ? `${count} pending access request${count > 1 ? 's' : ''}`
             : 'No pending requests'
         }
-        className="relative text-slate-400 hover:text-sky-500 p-2 rounded-lg hover:bg-sky-50 dark:hover:bg-sky-900/30"
+        className="relative text-slate-400 hover:text-sky-500 p-2 rounded-lg hover:bg-sky-50 dark:hover:bg-sky-900/30 transition-colors"
       >
         <Bell size={19} />
         {count > 0 && (
-          <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-bold flex items-center justify-center">
+          <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-bold flex items-center justify-center animate-pulse">
             {count > 9 ? '9+' : count}
           </span>
         )}
@@ -957,79 +972,151 @@ export const AccessRequestBell = ({ onHandled }) => {
 
       {open && (
         <>
-          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div className="absolute bottom-full right-0 mb-2 w-80 z-40 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-2xl shadow-xl overflow-hidden">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 dark:border-slate-700">
-              <p className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
-                <Bell size={13} /> Access requests
-              </p>
+          {/* Backdrop overlay */}
+          <div
+            className="fixed inset-0 z-40 bg-slate-900/20 backdrop-blur-[1px]"
+            onClick={() => setOpen(false)}
+          />
+
+          {/* Floating modal positioned cleanly beside the sidebar on desktop, or anchored at bottom on mobile */}
+          <div
+            className="fixed bottom-20 left-4 right-4 sm:right-auto sm:bottom-4 sm:left-[264px] z-50 sm:w-[420px] max-w-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh] animate-fade-in"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-3.5 border-b border-slate-100 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/80">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg bg-amber-100 dark:bg-amber-900/40 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+                  <Bell size={15} />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-slate-900 dark:text-white leading-none">
+                    Access Requests
+                  </h4>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                    {count} {count === 1 ? 'user pending review' : 'users pending review'}
+                  </p>
+                </div>
+              </div>
               <button
                 onClick={() => setOpen(false)}
-                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1 rounded-md"
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
+                title="Close"
               >
-                <X size={15} />
+                <X size={16} />
               </button>
             </div>
 
             {error && (
-              <p className="px-4 py-2 text-xs text-red-600 dark:text-red-300 bg-red-50 dark:bg-red-900/20">
-                {error}
-              </p>
+              <div className="px-4 py-2 text-xs text-rose-700 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/30 border-b border-rose-100 dark:border-rose-900/40 flex items-center gap-1.5">
+                <AlertTriangle size={13} className="shrink-0" />
+                <span>{error}</span>
+              </div>
             )}
 
-            <div className="max-h-80 overflow-y-auto custom-scrollbar">
+            {/* Content List */}
+            <div className="overflow-y-auto custom-scrollbar flex-1 divide-y divide-slate-100 dark:divide-slate-700/70">
               {count === 0 ? (
-                <p className="px-4 py-6 text-xs text-slate-400 text-center">
-                  Nobody is waiting on you.
-                </p>
+                <div className="py-10 px-4 text-center">
+                  <div className="w-12 h-12 rounded-full bg-slate-100 dark:bg-slate-700/60 flex items-center justify-center mx-auto mb-3 text-emerald-500">
+                    <CheckCircle2 size={24} />
+                  </div>
+                  <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                    All caught up
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1 max-w-xs mx-auto">
+                    There are no pending administrator access requests at this time.
+                  </p>
+                </div>
               ) : (
                 requests.map((request) => (
                   <div
                     key={request.username}
-                    className="px-4 py-3 border-b border-slate-100 dark:border-slate-700 last:border-b-0"
+                    className="p-4 hover:bg-slate-50/60 dark:hover:bg-slate-700/20 transition-colors"
                   >
-                    <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                      {request.full_name || request.username}
-                      {request.full_name && (
-                        <span className="text-slate-400 font-normal ml-1.5">
+                    <div className="flex items-start gap-3">
+                      <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-sky-500 to-indigo-600 text-white font-bold text-xs flex items-center justify-center uppercase shrink-0 shadow-sm">
+                        {(request.full_name || request.username || 'U').charAt(0)}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                            {request.full_name || request.username}
+                          </p>
+                          <span className="text-[10px] text-slate-400 shrink-0">
+                            {formatRequestedDate(request.requested_at)}
+                          </span>
+                        </div>
+                        <p className="text-xs text-sky-600 dark:text-sky-400 font-medium">
                           @{request.username}
-                        </span>
-                      )}
-                    </p>
-                    {request.organisation && (
-                      <p className="text-[11px] text-slate-400 truncate mt-0.5">
-                        {request.designation ? `${request.designation}, ` : ''}
-                        {request.organisation}
-                      </p>
-                    )}
-                    {request.reason && (
-                      <p className="text-xs text-slate-600 dark:text-slate-300 mt-1.5 leading-snug">
-                        {request.reason}
-                      </p>
-                    )}
-                    <div className="flex gap-2 mt-2.5">
-                      <button
-                        onClick={() => decide(request.username, true)}
-                        disabled={busy === request.username}
-                        className="flex-1 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-600 text-white text-xs font-semibold disabled:opacity-40"
-                      >
-                        {busy === request.username ? 'Saving' : 'Approve'}
-                      </button>
-                      <button
-                        onClick={() => decide(request.username, false)}
-                        disabled={busy === request.username}
-                        className="flex-1 py-1.5 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-40"
-                      >
-                        Decline
-                      </button>
+                        </p>
+
+                        {(request.organisation || request.designation) && (
+                          <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+                            <Building2 size={12} className="text-slate-400 shrink-0" />
+                            <span className="truncate">
+                              {request.designation ? `${request.designation}, ` : ''}
+                              {request.organisation}
+                            </span>
+                          </div>
+                        )}
+
+                        {request.email && (
+                          <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 mt-1">
+                            <Mail size={12} className="text-slate-400 shrink-0" />
+                            <span className="truncate">{request.email}</span>
+                          </div>
+                        )}
+
+                        {request.reason ? (
+                          <div className="mt-2.5 p-2.5 rounded-xl bg-slate-100/80 dark:bg-slate-900/60 border border-slate-200/60 dark:border-slate-700/60 text-xs text-slate-700 dark:text-slate-200">
+                            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 mb-1 flex items-center gap-1">
+                              <Quote size={10} /> Reason for request
+                            </p>
+                            <p className="leading-relaxed italic break-words">
+                              &ldquo;{request.reason}&rdquo;
+                            </p>
+                          </div>
+                        ) : null}
+
+                        <div className="flex gap-2 mt-3 pt-2">
+                          <button
+                            onClick={() => decide(request.username, true)}
+                            disabled={busy === request.username}
+                            className="flex-1 inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shadow-sm transition-all disabled:opacity-50"
+                          >
+                            {busy === request.username ? (
+                              <Loader2 size={13} className="animate-spin" />
+                            ) : (
+                              <Check size={13} strokeWidth={2.5} />
+                            )}
+                            <span>{busy === request.username ? 'Saving...' : 'Approve'}</span>
+                          </button>
+                          <button
+                            onClick={() => decide(request.username, false)}
+                            disabled={busy === request.username}
+                            className="inline-flex items-center justify-center gap-1 py-2 px-3 rounded-xl border border-rose-200 dark:border-rose-900/50 text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 text-xs font-medium transition-all disabled:opacity-50"
+                          >
+                            <X size={13} />
+                            <span>Decline</span>
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 ))
               )}
             </div>
+
+            {/* Footer */}
+            {count > 0 && (
+              <div className="px-4 py-2.5 bg-slate-50 dark:bg-slate-800/80 border-t border-slate-100 dark:border-slate-700 text-[11px] text-slate-500 dark:text-slate-400 text-center">
+                Approving promotes user immediately to Administrator.
+              </div>
+            )}
           </div>
         </>
       )}
-    </div>
+    </>
   );
 };
