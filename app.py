@@ -21,9 +21,11 @@ if backend_path not in sys.path:
     sys.path.insert(0, backend_path)
 
 import gradio as gr
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
+
 
 import auth
 import config
@@ -63,24 +65,8 @@ with gr.Blocks(title="ArchiveMind AI - API Server") as demo:
         gpu_btn = gr.Button("Check", visible=False)
         gpu_btn.click(fn=zero_gpu_anchor, outputs=None)
 
-# Mount all FastAPI routes directly onto demo.app
-demo.app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
-demo.app.include_router(ingestion.router, prefix="/api", tags=["ingestion"])
-demo.app.include_router(querying.router, prefix="/api", tags=["querying"])
-demo.app.include_router(graph_api.router, prefix="/api/graph", tags=["graph"])
-
-# Mount health endpoints
-demo.app.add_api_route("/health", main_health, methods=["GET"])
-demo.app.add_api_route("/health/db", main_health_db, methods=["GET"])
-demo.app.add_api_route("/health/config", main_health_config, methods=["GET"])
-
-# Mount exception handlers
-demo.app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-demo.app.add_exception_handler(RequestValidationError, validation_exception_handler)
-demo.app.add_exception_handler(Exception, unhandled_exception_handler)
-
-# Add CORS to demo.app
-demo.app.add_middleware(
+# Configure CORS middleware
+cors_middleware = Middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
     allow_origin_regex=r"https://.*\.vercel\.app",
@@ -89,7 +75,36 @@ demo.app.add_middleware(
     allow_headers=["*"],
 )
 
+def start_server():
+    port = int(os.getenv("PORT", 7860))
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        prevent_thread_lock=True,
+        strict_cors=False,
+        app_kwargs={"middleware": [cors_middleware]},
+    )
+
+    # Attach all FastAPI routers directly to the active server app
+    demo.app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+    demo.app.include_router(ingestion.router, prefix="/api", tags=["ingestion"])
+    demo.app.include_router(querying.router, prefix="/api", tags=["querying"])
+    demo.app.include_router(graph_api.router, prefix="/api/graph", tags=["graph"])
+
+    # Health endpoints
+    demo.app.add_api_route("/health", main_health, methods=["GET"])
+    demo.app.add_api_route("/health/db", main_health_db, methods=["GET"])
+    demo.app.add_api_route("/health/config", main_health_config, methods=["GET"])
+
+    # Exception handlers
+    demo.app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    demo.app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    demo.app.add_exception_handler(Exception, unhandled_exception_handler)
+
+    demo.block_thread()
+
 if __name__ == "__main__":
-    demo.launch()
+    start_server()
+
 
 
