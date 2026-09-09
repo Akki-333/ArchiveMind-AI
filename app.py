@@ -1,21 +1,24 @@
 import os
 import sys
 
-# Ensure backend directory is in sys.path
-backend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "backend"))
-if backend_path not in sys.path:
-    sys.path.insert(0, backend_path)
-
-# ZeroGPU anchor: satisfies Hugging Face ZeroGPU runtime check during startup
+# ZeroGPU initialization: must be performed before heavy framework imports
 try:
     import spaces
+    if hasattr(spaces, "zero") and hasattr(spaces.zero, "startup"):
+        spaces.zero.startup()
 
-    @spaces.GPU
+
+    @spaces.GPU(duration=1)
     def zero_gpu_anchor():
         return True
 except Exception:
     def zero_gpu_anchor():
         return True
+
+# Ensure backend directory is in sys.path
+backend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "backend"))
+if backend_path not in sys.path:
+    sys.path.insert(0, backend_path)
 
 import gradio as gr
 import uvicorn
