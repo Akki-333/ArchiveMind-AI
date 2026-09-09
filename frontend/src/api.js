@@ -9,12 +9,17 @@
  */
 import axios from 'axios';
 
-const defaultBaseUrl = import.meta.env.PROD
-  ? 'https://akki445-archivemind-backend.hf.space'
-  : 'http://127.0.0.1:8000';
+let resolvedBaseUrl = import.meta.env.VITE_API_URL || (
+  import.meta.env.PROD
+    ? 'https://akki445-archivemind-backend.hf.space/gradio_api'
+    : 'http://127.0.0.1:8000'
+);
+if (resolvedBaseUrl.includes('.hf.space') && !resolvedBaseUrl.endsWith('/gradio_api')) {
+  resolvedBaseUrl = resolvedBaseUrl.replace(/\/+$/, '') + '/gradio_api';
+}
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || defaultBaseUrl,
+  baseURL: resolvedBaseUrl,
   timeout: 120000,
 });
 

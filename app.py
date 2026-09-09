@@ -85,16 +85,18 @@ def start_server():
         app_kwargs={"middleware": [cors_middleware]},
     )
 
-    # Attach all FastAPI routers directly to the active server app
-    demo.app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
-    demo.app.include_router(ingestion.router, prefix="/api", tags=["ingestion"])
-    demo.app.include_router(querying.router, prefix="/api", tags=["querying"])
-    demo.app.include_router(graph_api.router, prefix="/api/graph", tags=["graph"])
+    # Attach all FastAPI routers directly to the active server app (both root and /gradio_api)
+    for pfx in ["", "/gradio_api"]:
+        demo.app.include_router(auth.router, prefix=f"{pfx}/api/auth", tags=["auth"])
+        demo.app.include_router(ingestion.router, prefix=f"{pfx}/api", tags=["ingestion"])
+        demo.app.include_router(querying.router, prefix=f"{pfx}/api", tags=["querying"])
+        demo.app.include_router(graph_api.router, prefix=f"{pfx}/api/graph", tags=["graph"])
 
-    # Health endpoints
-    demo.app.add_api_route("/health", main_health, methods=["GET"])
-    demo.app.add_api_route("/health/db", main_health_db, methods=["GET"])
-    demo.app.add_api_route("/health/config", main_health_config, methods=["GET"])
+        tag = pfx.replace("/", "_") or "_root"
+        demo.app.add_api_route(f"{pfx}/health", main_health, methods=["GET"], name=f"health{tag}")
+        demo.app.add_api_route(f"{pfx}/health/db", main_health_db, methods=["GET"], name=f"health_db{tag}")
+        demo.app.add_api_route(f"{pfx}/health/config", main_health_config, methods=["GET"], name=f"health_config{tag}")
+        demo.app.add_api_route(f"{pfx}/api/status", main_health, methods=["GET"], name=f"status{tag}")
 
     # Exception handlers
     demo.app.add_exception_handler(StarletteHTTPException, http_exception_handler)
