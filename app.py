@@ -13,10 +13,9 @@ try:
     @spaces.GPU
     def zero_gpu_anchor():
         return True
-
-    zero_gpu_anchor()
 except Exception:
-    pass
+    def zero_gpu_anchor():
+        return True
 
 import gradio as gr
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +35,8 @@ with gr.Blocks(title="ArchiveMind AI - API Server") as demo:
             label="System Status",
             interactive=False,
         )
+        gpu_btn = gr.Button("Check", visible=False)
+        gpu_btn.click(fn=zero_gpu_anchor, outputs=None)
 
 # Mount all FastAPI routes into demo.app
 demo.app.include_router(fastapi_app.router)
