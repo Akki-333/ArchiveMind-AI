@@ -18,8 +18,16 @@ except Exception:
         return True
 
 import gradio as gr
-from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from fastapi.responses import RedirectResponse
 from main import app as fastapi_app
+
+# Redirect root path to Gradio dashboard so the HF Space preview embeds properly
+fastapi_app.router.routes = [r for r in fastapi_app.router.routes if getattr(r, "path", "") != "/"]
+
+@fastapi_app.get("/", include_in_schema=False)
+def root_redirect():
+    return RedirectResponse(url="/gradio")
 
 # Create a clean status dashboard for the Hugging Face Space
 with gr.Blocks(title="ArchiveMind AI - API Server") as demo:
@@ -38,18 +46,11 @@ with gr.Blocks(title="ArchiveMind AI - API Server") as demo:
         gpu_btn = gr.Button("Check", visible=False)
         gpu_btn.click(fn=zero_gpu_anchor, outputs=None)
 
-# Mount all FastAPI routes into demo.app
-demo.app.include_router(fastapi_app.router)
-
-# Add CORS to demo.app
-cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
-demo.app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins if cors_origins else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Mount Gradio onto the primary FastAPI app under /gradio.
+# This preserves all FastAPI routers, CORS, middlewares, and lifespans while eliminating Gradio route conflicts.
+app = gr.mount_gradio_app(fastapi_app, demo, path="/gradio")
 
 if __name__ == "__main__":
-    demo.launch()
+    port = int(os.getenv("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+

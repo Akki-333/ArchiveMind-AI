@@ -92,14 +92,19 @@ const App = () => {
     setRole(cachedRole);
     fetchIdentity()
       .then((identity) => {
+        if (!identity || typeof identity !== 'object' || !identity.username) {
+          handleLogout();
+          return;
+        }
         setUsername(identity.username);
-        setRole(identity.role);
+        setRole(identity.role || 'user');
         setDisplayName(identity.full_name || '');
-        localStorage.setItem('role', identity.role);
+        localStorage.setItem('role', identity.role || 'user');
         setIsAuthenticated(true);
       })
       .catch(() => handleLogout())
       .finally(() => setBooting(false));
+
   }, [handleLogout]);
 
   const refreshDocuments = useCallback(() => {
@@ -194,7 +199,7 @@ const App = () => {
           <div className="p-4 border-t border-slate-200 dark:border-slate-700 flex justify-between items-center bg-slate-50 dark:bg-slate-800/50">
             <div className="flex items-center gap-3 min-w-0">
               <div className="w-9 h-9 rounded-full bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300 flex items-center justify-center border border-sky-200 dark:border-sky-700 font-bold uppercase shrink-0">
-                {username.charAt(0)}
+                {(username || 'U').charAt(0)}
               </div>
               <div className="min-w-0">
                 <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">

@@ -9,10 +9,15 @@
  */
 import axios from 'axios';
 
+const defaultBaseUrl = import.meta.env.PROD
+  ? 'https://akki445-archivemind-backend.hf.space'
+  : 'http://127.0.0.1:8000';
+
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000',
+  baseURL: import.meta.env.VITE_API_URL || defaultBaseUrl,
   timeout: 120000,
 });
+
 
 let onUnauthorized = null;
 export function setUnauthorizedHandler(handler) {
@@ -78,7 +83,7 @@ export const register = (username, password, details = {}) =>
   api.post('/api/auth/register', { username, password, ...details }).then((r) => r.data);
 
 /** Server-authoritative identity, plus the profile. Called on every boot. */
-export const fetchIdentity = () => api.get('/api/auth/me').then((r) => r.data);
+export const fetchIdentity = () => api.get('/api/auth/me', { timeout: 10000 }).then((r) => r.data);
 
 export const updateProfile = (profile) => api.put('/api/auth/me', profile).then((r) => r.data);
 
