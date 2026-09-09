@@ -231,32 +231,42 @@ const App = () => {
             )}
           </nav>
 
-          <div className="p-4 border-t border-slate-200 dark:border-slate-700 flex justify-between items-center bg-slate-50 dark:bg-slate-800/50">
+          {/*
+            Identity on one row, actions on the next.
+
+            Squeezing a name, a role and three icon buttons onto a single 256px
+            row left the name truncated and the icons crowded against the edge -
+            and the notification bell, being the widest of the three, sat
+            visibly off-centre against the two beside it. Two rows costs about
+            40px of sidebar height and gives everything room to align.
+          */}
+          <div className="border-t border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50 px-4 py-4 space-y-3">
             <div className="flex items-center gap-3 min-w-0">
-              <div className="w-9 h-9 rounded-full bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300 flex items-center justify-center border border-sky-200 dark:border-sky-700 font-bold uppercase shrink-0">
-                {(username || 'U').charAt(0)}
+              <div className="w-10 h-10 rounded-full bg-sky-100 dark:bg-sky-900 text-sky-600 dark:text-sky-300 flex items-center justify-center border border-sky-200 dark:border-sky-700 font-bold uppercase shrink-0">
+                {(displayName || username || 'U').charAt(0)}
               </div>
-              <div className="min-w-0">
-                <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-semibold text-slate-900 dark:text-white truncate leading-tight">
                   {displayName || username}
                 </p>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
+                <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
                   {isAdmin ? 'Administrator' : 'Reader'}
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-1 shrink-0">
+
+            <div className="flex items-center justify-around gap-1 pt-0.5">
               {isAdmin && <AccessRequestBell onHandled={refreshIdentity} />}
               <button
                 onClick={() => setShowSettings(true)}
-                className="text-slate-400 hover:text-sky-500 p-2 rounded-lg hover:bg-sky-50 dark:hover:bg-sky-900/30"
+                className="text-slate-400 hover:text-sky-500 p-2 rounded-lg hover:bg-sky-100 dark:hover:bg-sky-900/30 transition-colors"
                 title="Settings"
               >
                 <Settings size={19} />
               </button>
               <button
                 onClick={handleLogout}
-                className="text-slate-400 hover:text-red-500 p-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20"
+                className="text-slate-400 hover:text-red-500 p-2 rounded-lg hover:bg-red-100 dark:hover:bg-red-900/20 transition-colors"
                 title="Sign out"
               >
                 <LogOut size={19} />

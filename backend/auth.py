@@ -55,9 +55,20 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,32}$")
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 
-# Who someone says they are. A *profile* field, never a permission - it tells an
-# administrator who is asking. Set from the profile screen, not at sign-up.
-ACCOUNT_TYPES = {"citizen", "researcher", "official"}
+# Who someone says they are. A *profile* field, never a permission.
+#
+# Collected at sign-up again, having been removed alongside the access code.
+# The distinction matters: the access code was a credential prompt on an
+# anonymous form and could grant privilege, so it had to go. This grants
+# nothing. It is also the single most useful thing an administrator has when
+# deciding an access request - a citizen and a government official are very
+# different people to hand the delete button to - and asking once at sign-up
+# beats asking nobody.
+#
+# `staff` is the person working inside a department under an official: they
+# handle the documents day to day without owning what the archive contains.
+ACCOUNT_TYPES = {"citizen", "staff", "official"}
+DEFAULT_ACCOUNT_TYPE = "citizen"
 
 
 # --- Models ------------------------------------------------------------------
@@ -80,12 +91,26 @@ class UserRegister(BaseModel):
     password: str = Field(min_length=1, max_length=128)
     full_name: str = Field(default="", max_length=120)
     email: str = Field(default="", max_length=160)
+    # Profile, not permission. An unrecognised value falls back to the default
+    # rather than being rejected, because this can never grant anything and a
+    # failed sign-up over a cosmetic field would be a poor trade.
+    account_type: str = Field(default=DEFAULT_ACCOUNT_TYPE, max_length=20)
 
 
 class AccessRequest(BaseModel):
     """Ask for administrator access from inside the application."""
     reason: str = Field(default="", max_length=500)
     access_code: str = Field(default="", max_length=128)
+
+
+class AccountDeletion(BaseModel):
+    """Close your own account.
+
+    The current password is required even though the caller is already
+    authenticated. Deletion is irreversible, so a token left behind on a shared
+    machine must not be enough to destroy someone's account.
+    """
+    password: str = Field(min_length=1, max_length=128)
 
 
 class UserLogin(BaseModel):
@@ -340,6 +365,10 @@ def register_user(user: UserRegister):
     validate_password(user.password)
     email = validate_email(user.email)
 
+    account_type = user.account_type.strip().lower()
+    if account_type not in ACCOUNT_TYPES:
+        account_type = DEFAULT_ACCOUNT_TYPE
+
     with neo4j_driver.session() as session:
         role = _resolve_role_for_new_user(session, username)
         try:
@@ -349,7 +378,7 @@ def register_user(user: UserRegister):
                 """
                 CREATE (u:User {
                     username: $username, password_hash: $password_hash, role: $role,
-                    full_name: $full_name, email: $email, account_type: 'citizen',
+                    full_name: $full_name, email: $email, account_type: $account_type,
                     organisation: '', designation: '', requested_role: '',
                     created_at: $ts
                 })
@@ -359,6 +388,7 @@ def register_user(user: UserRegister):
                 role=role,
                 full_name=user.full_name.strip()[:120],
                 email=email,
+                account_type=account_type,
                 ts=int(time.time() * 1000),
             )
         except Exception as exc:
@@ -472,6 +502,111 @@ def change_password(
     return {"status": "success", "message": "Your password has been updated."}
 
 
+@router.delete("/me")
+def delete_own_account(
+    payload: AccountDeletion, user: CurrentUser = Depends(get_current_user)
+):
+    """Close your own account. Available to everyone, administrators included.
+
+    Three things have to be right here, and the middle one is the subtle one.
+
+    **The password is required.** Deletion is irreversible, so a token left on
+    a shared machine must not be enough to destroy an account.
+
+    **Uploaded documents are transferred, not deleted.** The archive is shared:
+    `get_user_documents` reaches documents through
+    `(owner:User)-[:UPLOADED]->(:Document)`, so detaching a user who had
+    uploaded anything would leave those documents orphaned and they would
+    silently vanish from every other user's view - the chunks and vectors still
+    on disk, the documents simply gone. They are re-pointed at the
+    longest-serving remaining administrator instead.
+
+    **The last administrator cannot leave.** An archive nobody can administer
+    is one where no document can ever be added or removed again. This mirrors
+    the existing guard on role changes.
+    """
+    record = _fetch_user(user.username)
+    if not record or not verify_password(payload.password, record.get("password_hash") or ""):
+        raise HTTPException(status_code=400, detail="That password is not correct.")
+
+    with neo4j_driver.session() as session:
+        successor = None
+        if user.is_admin:
+            remaining = session.run(
+                "MATCH (u:User) WHERE u.role = 'admin' AND u.username <> $username "
+                "RETURN u.username AS username ORDER BY coalesce(u.created_at, 0) ASC "
+                "LIMIT 1",
+                username=user.username,
+            ).single()
+            if not remaining:
+                raise HTTPException(
+                    status_code=400,
+                    detail="You are the last administrator. Promote someone else "
+                           "before deleting your account.",
+                )
+            successor = remaining["username"]
+
+        owned = session.run(
+            "MATCH (u:User {username: $username})-[:UPLOADED]->(d:Document) "
+            "RETURN count(d) AS n",
+            username=user.username,
+        ).single()
+        document_count = (owned["n"] if owned else 0) or 0
+
+        if document_count:
+            if not successor:
+                # A reader with documents should not be possible - only admins
+                # can ingest - but if a demoted admin still owns some, hand them
+                # to an administrator rather than orphaning them.
+                fallback = session.run(
+                    "MATCH (u:User) WHERE u.role = 'admin' AND u.username <> $username "
+                    "RETURN u.username AS username ORDER BY coalesce(u.created_at, 0) ASC "
+                    "LIMIT 1",
+                    username=user.username,
+                ).single()
+                if not fallback:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Your uploaded documents have nowhere to go. Ask an "
+                               "administrator to take them over first.",
+                    )
+                successor = fallback["username"]
+
+            session.run(
+                """
+                MATCH (old:User {username: $username})-[r:UPLOADED]->(d:Document)
+                MATCH (new:User {username: $successor})
+                MERGE (new)-[:UPLOADED]->(d)
+                DELETE r
+                """,
+                username=user.username, successor=successor,
+            )
+            logger.info(
+                "Transferred %d document(s) from '%s' to '%s' on account deletion.",
+                document_count, user.username, successor,
+            )
+
+        # Conversations are private, so they go with the person.
+        session.run(
+            """
+            MATCH (u:User {username: $username})-[:HAS_SESSION]->(s:ChatSession)
+            OPTIONAL MATCH (s)-[:HAS_MESSAGE]->(m:Message)
+            DETACH DELETE m, s
+            """,
+            username=user.username,
+        )
+        session.run("MATCH (u:User {username: $username}) DETACH DELETE u",
+                    username=user.username)
+
+    logger.info("Account '%s' deleted at the owner's request.", user.username)
+    return {
+        "status": "deleted",
+        "documents_transferred": document_count,
+        "transferred_to": successor,
+        "message": "Your account has been deleted.",
+    }
+
+
 # --- Administrator access requests -------------------------------------------
 @router.post("/request-access")
 def request_admin_access(
@@ -565,7 +700,7 @@ def list_access_requests(_: CurrentUser = Depends(require_admin)):
             RETURN u.username AS username, u.full_name AS full_name,
                    u.email AS email, u.organisation AS organisation,
                    u.designation AS designation, u.request_reason AS reason,
-                   u.requested_at AS requested_at
+                   u.account_type AS account_type, u.requested_at AS requested_at
             ORDER BY coalesce(u.requested_at, 0) DESC
             """,
             role=ROLE_ADMIN,
@@ -577,6 +712,10 @@ def list_access_requests(_: CurrentUser = Depends(require_admin)):
                 "email": r["email"] or "",
                 "organisation": r["organisation"] or "",
                 "designation": r["designation"] or "",
+                # The whole reason account_type is collected at sign-up: it is
+                # what an administrator weighs when deciding this request.
+                # Returning the requests without it made the field decorative.
+                "account_type": r["account_type"] or DEFAULT_ACCOUNT_TYPE,
                 "reason": r["reason"] or "",
                 "requested_at": r["requested_at"],
             }

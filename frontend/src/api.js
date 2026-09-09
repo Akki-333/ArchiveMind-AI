@@ -100,6 +100,17 @@ export const updatePassword = (payload) =>
   api.put('/api/auth/me/password', payload).then((r) => r.data);
 
 /**
+ * Close your own account. Irreversible, which is why the server insists on the
+ * password rather than trusting the bearer token alone.
+ *
+ * axios needs `data` inside the config object for a DELETE body. Passing it
+ * positionally the way `post` accepts it silently sends nothing, and the
+ * request then fails validation for a reason that looks nothing like the cause.
+ */
+export const deleteAccount = (password) =>
+  api.delete('/api/auth/me', { data: { password } }).then((r) => r.data);
+
+/**
  * Ask for administrator access from inside the app.
  * A valid code grants it immediately; anything else records a pending request.
  */

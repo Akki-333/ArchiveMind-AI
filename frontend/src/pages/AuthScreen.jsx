@@ -6,32 +6,49 @@ import { Spinner } from '../components/common';
 import logoImg from '../assets/logo.jpg';
 
 /**
- * Sign in, or create an account. Nothing else.
+ * Sign in, or create an account.
  *
- * This form has lost three things across two passes, each for the same reason.
+ * Two things this form no longer has, and one it kept.
  *
- * First a "Government Official (Admin)" dropdown, which the server honoured -
- * so anyone could become an administrator of a government policy archive by
- * picking an option.
+ * Gone: a "Government Official (Admin)" dropdown the server honoured, so
+ * anyone could become an administrator of a government policy archive by
+ * picking an option. And an "official access code" - a credential prompt on an
+ * anonymous page, which teaches people to type secrets into sign-up forms, and
+ * which an attacker could guess without ever authenticating.
  *
- * Then an account-type selector, a department, a designation and an "official
- * access code". Those were safe, because the server decided the role either
- * way, but they were still wrong: they asked someone to declare their privilege
- * level before they had seen a single document, and the access code put a
- * credential prompt on an anonymous page, which teaches people to type secrets
- * into sign-up forms.
- *
- * What remains is what an account actually needs. Administrator access is
- * requested from Settings by someone signed in who has used the product, and
- * the profile fields live there too, where they can be filled in at leisure
- * instead of gating the first screen anyone sees.
+ * Kept: who you are. That is a profile label, not a permission, and the
+ * distinction is the whole design - see ACCOUNT_TYPES below. Department and
+ * designation live in Settings, where they can be filled in at leisure instead
+ * of gating the first screen anyone sees, and administrator access is
+ * requested from there too, by someone who has actually used the product.
  */
+
+/**
+ * Who you are, not what you may do.
+ *
+ * This grants nothing - the server's role resolution does not take it as an
+ * argument, so it cannot influence the outcome - but it is the most useful
+ * thing an administrator has when deciding an access request later, because a
+ * citizen and a government official are very different people to hand the
+ * delete button to.
+ *
+ * "Department staff" is the person inside a department working under an
+ * official: they handle the documents day to day without owning what the
+ * archive contains.
+ */
+const ACCOUNT_TYPES = [
+  { key: 'citizen', label: 'Citizen', hint: 'Read and question the public archive' },
+  { key: 'staff', label: 'Department staff', hint: 'Work with these documents day to day' },
+  { key: 'official', label: 'Government official', hint: 'Responsible for what the archive holds' },
+];
+
 export const AuthScreen = ({ onLogin }) => {
   const [isLogin, setIsLogin] = useState(true);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
+  const [accountType, setAccountType] = useState('citizen');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -45,6 +62,7 @@ export const AuthScreen = ({ onLogin }) => {
         : await register(username, password, {
             full_name: fullName.trim(),
             email: email.trim(),
+            account_type: accountType,
           });
       saveSession(data);
       onLogin(data.username, data.role);
@@ -84,6 +102,34 @@ export const AuthScreen = ({ onLogin }) => {
         <form onSubmit={handleSubmit} className="space-y-5">
           {!isLogin && (
             <>
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                  I am a
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {ACCOUNT_TYPES.map((type) => (
+                    <button
+                      key={type.key}
+                      type="button"
+                      onClick={() => setAccountType(type.key)}
+                      title={type.hint}
+                      className={`px-2 py-2.5 rounded-xl border text-[11px] font-semibold leading-tight transition-all ${
+                        accountType === type.key
+                          ? 'bg-sky-50 border-sky-400 text-sky-700 ring-1 ring-sky-400'
+                          : 'bg-white border-slate-200 text-slate-500 hover:border-sky-200'
+                      }`}
+                    >
+                      {type.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
+                  {ACCOUNT_TYPES.find((t) => t.key === accountType)?.hint}. This
+                  tells administrators who you are - every new account starts as
+                  a reader either way.
+                </p>
+              </div>
+
               <div>
                 <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
                   Full name

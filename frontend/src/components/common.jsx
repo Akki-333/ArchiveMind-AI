@@ -3,10 +3,11 @@ import { Link, useLocation } from 'react-router-dom';
 import {
   Check, ChevronDown, Copy, FileText, Plus, Settings, X, Moon, Sun,
   Quote, AlertTriangle, CheckCircle2, Loader2, Pencil, Sparkles,
-  User, Mail, Building2, BadgeCheck, KeyRound, ShieldCheck, Bell, Send,
+  User, Mail, Building2, BadgeCheck, KeyRound, ShieldCheck, Bell, Send, Trash2,
 } from 'lucide-react';
 import {
-  declineAccessRequest, errorMessage, fetchAccessRequests, fetchHealth,
+  clearSession, declineAccessRequest, deleteAccount, errorMessage,
+  fetchAccessRequests, fetchHealth,
   fetchIdentity, requestAdminAccess, updatePassword, updateProfile,
   updateUserRole, withdrawAccessRequest,
 } from '../api';
@@ -496,6 +497,8 @@ export const SettingsPanel = ({
   });
   const [passwords, setPasswords] = useState({ current_password: '', new_password: '' });
   const [accessForm, setAccessForm] = useState({ reason: '', access_code: '' });
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
   const [status, setStatus] = useState(null);
   const [saving, setSaving] = useState(false);
 
@@ -578,6 +581,27 @@ export const SettingsPanel = ({
       setStatus({ kind: 'error', text: errorMessage(err, 'That request could not be withdrawn.') });
     }
     setSaving(false);
+  };
+
+  /**
+   * Close the account.
+   *
+   * On success the session is cleared and the page reloaded rather than
+   * updating state: every screen behind this modal is built around a user who
+   * no longer exists, and the next request would 401 anyway. A clean reload to
+   * the sign-in screen is the honest end state.
+   */
+  const confirmDeleteAccount = async () => {
+    setSaving(true);
+    setStatus(null);
+    try {
+      await deleteAccount(deletePassword);
+      clearSession();
+      window.location.assign('/');
+    } catch (err) {
+      setStatus({ kind: 'error', text: errorMessage(err, 'Your account could not be deleted.') });
+      setSaving(false);
+    }
   };
 
   const isReader = role !== 'admin';
@@ -803,6 +827,76 @@ export const SettingsPanel = ({
               >
                 {saving ? <Spinner size={15} /> : <ShieldCheck size={15} />} Update password
               </button>
+
+              <div className="pt-5 mt-5 border-t border-slate-200 dark:border-slate-600">
+                <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-2">
+                  Danger zone
+                </p>
+
+                {!confirmingDelete ? (
+                  <>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed mb-3">
+                      Deleting your account removes your profile and every
+                      conversation you have had. Documents you added to the
+                      shared archive stay, and are handed to another
+                      administrator.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmingDelete(true);
+                        setStatus(null);
+                      }}
+                      className="w-full py-3 rounded-xl border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 font-medium text-sm hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center gap-2"
+                    >
+                      <Trash2 size={15} /> Delete my account
+                    </button>
+                  </>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="p-3 rounded-xl bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+                      <p className="text-xs font-semibold text-red-700 dark:text-red-300">
+                        This cannot be undone.
+                      </p>
+                      <p className="text-[11px] text-red-600 dark:text-red-400 mt-1 leading-relaxed">
+                        Confirm with your password to delete
+                        <strong> {username}</strong> permanently.
+                      </p>
+                    </div>
+
+                    <Field
+                      icon={KeyRound}
+                      label="Your password"
+                      type="password"
+                      value={deletePassword}
+                      onChange={setDeletePassword}
+                      placeholder="Confirm it is you"
+                      autoComplete="current-password"
+                    />
+
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setConfirmingDelete(false);
+                          setDeletePassword('');
+                        }}
+                        className="flex-1 py-2.5 rounded-xl border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 font-medium text-sm hover:bg-slate-50 dark:hover:bg-slate-700"
+                      >
+                        Keep my account
+                      </button>
+                      <button
+                        type="button"
+                        onClick={confirmDeleteAccount}
+                        disabled={saving || !deletePassword}
+                        className="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold text-sm disabled:opacity-40 flex items-center justify-center gap-2"
+                      >
+                        {saving ? <Spinner size={14} /> : <Trash2 size={14} />} Delete
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </form>
           )}
 
@@ -890,6 +984,20 @@ export const SettingsPanel = ({
 
 
 // --- Access request notification ---------------------------------------------
+/**
+ * Labels for the sign-up account type.
+ *
+ * Deliberately tolerant: accounts created before the vocabulary changed still
+ * carry "researcher", and an unrecognised value must render as something rather
+ * than as a blank chip.
+ */
+const ACCOUNT_TYPE_LABEL = {
+  citizen: 'Citizen',
+  staff: 'Department staff',
+  official: 'Government official',
+  researcher: 'Researcher',
+};
+
 /**
  * Tells an administrator that someone is waiting on them.
  *
@@ -1047,9 +1155,26 @@ export const AccessRequestBell = ({ onHandled }) => {
                             {formatRequestedDate(request.requested_at)}
                           </span>
                         </div>
-                        <p className="text-xs text-sky-600 dark:text-sky-400 font-medium">
-                          @{request.username}
-                        </p>
+                        <div className="flex items-center gap-2 flex-wrap mt-0.5">
+                          <p className="text-xs text-sky-600 dark:text-sky-400 font-medium">
+                            @{request.username}
+                          </p>
+                          {/*
+                            What the decision actually turns on. The account
+                            type is collected at sign-up precisely so it can be
+                            read here; without it on the card the field would be
+                            decorative.
+                          */}
+                          <span
+                            className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                              request.account_type === 'official'
+                                ? 'bg-sky-100 text-sky-700 dark:bg-sky-900/50 dark:text-sky-300'
+                                : 'bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+                            }`}
+                          >
+                            {ACCOUNT_TYPE_LABEL[request.account_type] || 'Citizen'}
+                          </span>
+                        </div>
 
                         {(request.organisation || request.designation) && (
                           <div className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 mt-1.5">

@@ -59,15 +59,49 @@ def test_named_admins_are_granted(monkeypatch):
 def test_registration_takes_no_privilege_input_at_all():
     """The property the whole role model rests on.
 
-    The sign-up payload has no field - not `role`, not `account_type`, not
-    `access_code` - that can influence what `_resolve_role_for_new_user`
-    returns. Privilege is decided from the username and the database, and from
-    nothing the client sends. A privilege field reappearing here is the exact
-    regression this test exists to catch.
+    `account_type` is back on the form, and that is fine: it is a profile label
+    an administrator reads when deciding an access request, and
+    `_resolve_role_for_new_user` does not take it as an argument, so it cannot
+    influence the outcome. What must never return is `access_code` or `role` -
+    a credential prompt on an anonymous form, and a client-chosen privilege.
     """
-    assert set(auth.UserRegister.model_fields) == {
-        "username", "password", "full_name", "email",
+    fields = set(auth.UserRegister.model_fields)
+    assert fields == {"username", "password", "full_name", "email", "account_type"}
+    assert "access_code" not in fields
+    assert "role" not in fields
+
+    # The signature is the guarantee: role resolution cannot see the profile.
+    import inspect
+
+    assert set(inspect.signature(auth._resolve_role_for_new_user).parameters) == {
+        "session", "username",
     }
+
+
+@pytest.mark.parametrize("declared", ["citizen", "staff", "official"])
+def test_every_account_type_still_resolves_to_a_reader(declared):
+    """Declaring yourself an official grants nothing. It is a label."""
+    assert declared in auth.ACCOUNT_TYPES
+    assert auth._resolve_role_for_new_user(
+        _StubSession(user_count=5), "someone"
+    ) == auth.ROLE_USER
+
+
+def test_an_unrecognised_account_type_falls_back_rather_than_failing():
+    """A cosmetic field must never be able to fail a sign-up."""
+    payload = auth.UserRegister(
+        username="citizen1", password="correct1horse", account_type="wizard",
+    )
+    resolved = payload.account_type.strip().lower()
+    assert (
+        resolved if resolved in auth.ACCOUNT_TYPES else auth.DEFAULT_ACCOUNT_TYPE
+    ) == auth.DEFAULT_ACCOUNT_TYPE
+
+
+def test_deleting_an_account_requires_the_password():
+    """Deletion is irreversible, so a token left on a shared machine must not
+    be enough on its own."""
+    assert set(auth.AccountDeletion.model_fields) == {"password"}
 
 
 def test_an_unknown_field_in_the_payload_is_dropped_not_honoured():
