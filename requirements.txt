@@ -1,4 +1,5 @@
 gradio>=4.0.0
+spaces>=0.28.0
 
 # --- Web framework ---
 fastapi>=0.110.0
