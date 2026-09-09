@@ -3,9 +3,13 @@ import { Link, useLocation } from 'react-router-dom';
 import {
   Check, ChevronDown, Copy, FileText, Plus, Settings, X, Moon, Sun,
   Quote, AlertTriangle, CheckCircle2, Loader2, Pencil, Sparkles,
-  User, Mail, Building2, BadgeCheck, KeyRound, ShieldCheck,
+  User, Mail, Building2, BadgeCheck, KeyRound, ShieldCheck, Bell, Send,
 } from 'lucide-react';
-import { fetchHealth, fetchIdentity, updatePassword, updateProfile, errorMessage } from '../api';
+import {
+  declineAccessRequest, errorMessage, fetchAccessRequests, fetchHealth,
+  fetchIdentity, requestAdminAccess, updatePassword, updateProfile,
+  updateUserRole, withdrawAccessRequest,
+} from '../api';
 import { getDocumentDomain, DOMAIN_LIST } from '../lib/graph';
 import { CodeBlock } from './CodeBlock';
 import { Answer } from './Answer';
@@ -483,7 +487,7 @@ const ROLE_BLURB = {
  * name, contact, department, job title and password — is editable.
  */
 export const SettingsPanel = ({
-  darkMode, setDarkMode, onClose, username, role, onProfileSaved,
+  darkMode, setDarkMode, onClose, username, role, onProfileSaved, onRoleChanged,
 }) => {
   const [tab, setTab] = useState('general');
   const [profile, setProfile] = useState(null);
@@ -491,6 +495,7 @@ export const SettingsPanel = ({
     full_name: '', email: '', organisation: '', designation: '',
   });
   const [passwords, setPasswords] = useState({ current_password: '', new_password: '' });
+  const [accessForm, setAccessForm] = useState({ reason: '', access_code: '' });
   const [status, setStatus] = useState(null);
   const [saving, setSaving] = useState(false);
 
@@ -537,10 +542,52 @@ export const SettingsPanel = ({
     setSaving(false);
   };
 
+  /**
+   * Ask for administrator access.
+   *
+   * A correct code is granted server-side immediately, which is why this
+   * reports the returned status rather than assuming "pending" - telling
+   * someone their request is queued when they have just been promoted would
+   * leave them staring at a sidebar that has already changed.
+   */
+  const submitAccessRequest = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setStatus(null);
+    try {
+      const result = await requestAdminAccess(accessForm);
+      setAccessForm({ reason: '', access_code: '' });
+      setStatus({ kind: 'success', text: result.message });
+      const refreshed = await fetchIdentity();
+      setProfile(refreshed);
+      if (result.status === 'granted') onRoleChanged?.(refreshed);
+    } catch (err) {
+      setStatus({ kind: 'error', text: errorMessage(err, 'That request could not be sent.') });
+    }
+    setSaving(false);
+  };
+
+  const cancelAccessRequest = async () => {
+    setSaving(true);
+    setStatus(null);
+    try {
+      await withdrawAccessRequest();
+      setProfile(await fetchIdentity());
+      setStatus({ kind: 'success', text: 'Your request has been withdrawn.' });
+    } catch (err) {
+      setStatus({ kind: 'error', text: errorMessage(err, 'That request could not be withdrawn.') });
+    }
+    setSaving(false);
+  };
+
+  const isReader = role !== 'admin';
   const tabs = [
     { key: 'general', label: 'General' },
     { key: 'profile', label: 'Profile' },
     { key: 'security', label: 'Security' },
+    // Only a reader can ask for more. Showing an administrator a tab that
+    // tells them they already have access is noise.
+    ...(isReader ? [{ key: 'access', label: 'Access' }] : []),
   ];
 
   return (
@@ -646,12 +693,6 @@ export const SettingsPanel = ({
                   <CheckCircle2 size={12} className="text-emerald-500" />
                   {ROLE_BLURB[role] || ROLE_BLURB.user}
                 </p>
-                {profile?.requested_role === 'admin' && (
-                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-2 flex items-start gap-1.5">
-                    <ShieldCheck size={12} className="mt-0.5 shrink-0" />
-                    Official access requested — waiting for an administrator to approve it.
-                  </p>
-                )}
                 {/*
                   Telling people their questions are recorded is not optional
                   politeness. This is a government service, the log is shown to
@@ -764,8 +805,231 @@ export const SettingsPanel = ({
               </button>
             </form>
           )}
+
+          {tab === 'access' && (
+            <form onSubmit={submitAccessRequest} className="space-y-4">
+              <div className="p-4 bg-slate-50 dark:bg-slate-700/60 rounded-xl border border-slate-200 dark:border-slate-600">
+                <p className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+                  <ShieldCheck size={16} className="text-sky-500" />
+                  Administrator access
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 leading-relaxed">
+                  Administrators can add and remove documents from the shared
+                  archive. Readers can explore and ask questions, which is what
+                  most accounts need.
+                </p>
+              </div>
+
+              {profile?.requested_role === 'admin' ? (
+                <>
+                  <div className="p-4 rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20">
+                    <p className="text-sm font-semibold text-amber-800 dark:text-amber-300 flex items-center gap-2">
+                      <Bell size={15} /> Request pending
+                    </p>
+                    <p className="text-xs text-amber-700 dark:text-amber-400 mt-1.5 leading-relaxed">
+                      An administrator has been notified and will review it.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={cancelAccessRequest}
+                    disabled={saving}
+                    className="w-full py-3 rounded-xl border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 font-medium text-sm hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-40"
+                  >
+                    Withdraw request
+                  </button>
+                </>
+              ) : (
+                <>
+                  <label className="block">
+                    <span className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-1.5">
+                      Why do you need it?
+                    </span>
+                    <textarea
+                      value={accessForm.reason}
+                      onChange={(e) =>
+                        setAccessForm({ ...accessForm, reason: e.target.value })
+                      }
+                      rows={3}
+                      maxLength={500}
+                      placeholder="For example: I manage the finance circulars for my department."
+                      className="w-full bg-slate-50 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 text-slate-900 dark:text-white rounded-xl py-2.5 px-3 text-sm focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 placeholder-slate-400 resize-none"
+                    />
+                  </label>
+
+                  <Field
+                    icon={KeyRound}
+                    label="Access code (optional)"
+                    type="password"
+                    value={accessForm.access_code}
+                    onChange={(v) => setAccessForm({ ...accessForm, access_code: v })}
+                    placeholder="If your department issued you one"
+                    maxLength={128}
+                  />
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    A valid code grants access immediately. Without one your
+                    request is sent to an administrator to approve.
+                  </p>
+
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="w-full bg-sky-500 hover:bg-sky-600 text-white py-3 rounded-xl font-semibold text-sm disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {saving ? <Spinner size={15} /> : <Send size={15} />} Send request
+                  </button>
+                </>
+              )}
+            </form>
+          )}
         </div>
       </div>
+    </div>
+  );
+};
+
+
+// --- Access request notification ---------------------------------------------
+/**
+ * Tells an administrator that someone is waiting on them.
+ *
+ * A pending request used to be visible only if an administrator happened to
+ * open the People screen, which nobody does speculatively - so a reader could
+ * wait indefinitely for an approval nobody knew had been asked for. This puts
+ * it where they already are.
+ *
+ * Both decisions are available from the notification itself. A badge you can
+ * only acknowledge and never clear is a badge people learn to ignore.
+ */
+export const AccessRequestBell = ({ onHandled }) => {
+  const [requests, setRequests] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+
+  const load = () =>
+    fetchAccessRequests()
+      .then((data) => setRequests(data.requests || []))
+      .catch(() => setRequests([]));
+
+  useEffect(() => {
+    load();
+    // Sixty seconds is fine for something nobody is watching a clock for, and
+    // cheap: the endpoint returns names, not the whole directory.
+    const timer = setInterval(load, 60000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const decide = async (username, approve) => {
+    setBusy(username);
+    setError('');
+    try {
+      if (approve) await updateUserRole(username, 'admin');
+      else await declineAccessRequest(username);
+      await load();
+      onHandled?.();
+    } catch (err) {
+      setError(errorMessage(err, 'That decision could not be saved.'));
+    }
+    setBusy('');
+  };
+
+  const count = requests.length;
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title={
+          count
+            ? `${count} pending access request${count > 1 ? 's' : ''}`
+            : 'No pending requests'
+        }
+        className="relative text-slate-400 hover:text-sky-500 p-2 rounded-lg hover:bg-sky-50 dark:hover:bg-sky-900/30"
+      >
+        <Bell size={19} />
+        {count > 0 && (
+          <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-white text-[10px] font-bold flex items-center justify-center">
+            {count > 9 ? '9+' : count}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div className="absolute bottom-full right-0 mb-2 w-80 z-40 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 rounded-2xl shadow-xl overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 dark:border-slate-700">
+              <p className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                <Bell size={13} /> Access requests
+              </p>
+              <button
+                onClick={() => setOpen(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1 rounded-md"
+              >
+                <X size={15} />
+              </button>
+            </div>
+
+            {error && (
+              <p className="px-4 py-2 text-xs text-red-600 dark:text-red-300 bg-red-50 dark:bg-red-900/20">
+                {error}
+              </p>
+            )}
+
+            <div className="max-h-80 overflow-y-auto custom-scrollbar">
+              {count === 0 ? (
+                <p className="px-4 py-6 text-xs text-slate-400 text-center">
+                  Nobody is waiting on you.
+                </p>
+              ) : (
+                requests.map((request) => (
+                  <div
+                    key={request.username}
+                    className="px-4 py-3 border-b border-slate-100 dark:border-slate-700 last:border-b-0"
+                  >
+                    <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                      {request.full_name || request.username}
+                      {request.full_name && (
+                        <span className="text-slate-400 font-normal ml-1.5">
+                          @{request.username}
+                        </span>
+                      )}
+                    </p>
+                    {request.organisation && (
+                      <p className="text-[11px] text-slate-400 truncate mt-0.5">
+                        {request.designation ? `${request.designation}, ` : ''}
+                        {request.organisation}
+                      </p>
+                    )}
+                    {request.reason && (
+                      <p className="text-xs text-slate-600 dark:text-slate-300 mt-1.5 leading-snug">
+                        {request.reason}
+                      </p>
+                    )}
+                    <div className="flex gap-2 mt-2.5">
+                      <button
+                        onClick={() => decide(request.username, true)}
+                        disabled={busy === request.username}
+                        className="flex-1 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-600 text-white text-xs font-semibold disabled:opacity-40"
+                      >
+                        {busy === request.username ? 'Saving' : 'Approve'}
+                      </button>
+                      <button
+                        onClick={() => decide(request.username, false)}
+                        disabled={busy === request.username}
+                        className="flex-1 py-1.5 rounded-lg border border-slate-200 dark:border-slate-600 text-slate-600 dark:text-slate-300 text-xs font-medium hover:bg-slate-50 dark:hover:bg-slate-700 disabled:opacity-40"
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 };

@@ -37,63 +37,59 @@ class _StubSession:
 # --- Role resolution ---------------------------------------------------------
 def test_first_account_on_an_empty_database_becomes_admin():
     """The bootstrap rule, without which a fresh deployment is unusable."""
-    role, requested = auth._resolve_role_for_new_user(
-        _StubSession(user_count=0), "founder", "citizen", ""
-    )
-    assert role == auth.ROLE_ADMIN
-    assert requested == ""
+    assert auth._resolve_role_for_new_user(
+        _StubSession(user_count=0), "founder"
+    ) == auth.ROLE_ADMIN
 
 
 def test_a_later_account_is_a_reader():
-    role, requested = auth._resolve_role_for_new_user(
-        _StubSession(user_count=5), "citizen1", "citizen", ""
-    )
-    assert role == auth.ROLE_USER
-    assert requested == ""
+    assert auth._resolve_role_for_new_user(
+        _StubSession(user_count=5), "citizen1"
+    ) == auth.ROLE_USER
 
 
-def test_claiming_to_be_an_official_grants_nothing_without_the_code():
-    """The security property the sign-up form depends on. Selecting
-    "Government official" is a request, never a grant."""
-    role, requested = auth._resolve_role_for_new_user(
-        _StubSession(user_count=5), "impostor", "official", ""
-    )
-    assert role == auth.ROLE_USER
-    assert requested == auth.ROLE_ADMIN  # recorded for an admin to approve
-
-
-def test_a_wrong_access_code_grants_nothing():
-    role, requested = auth._resolve_role_for_new_user(
-        _StubSession(user_count=5), "impostor", "official", "not-the-code"
-    )
-    assert role == auth.ROLE_USER
-    assert requested == auth.ROLE_ADMIN
-
-
-def test_the_correct_access_code_grants_admin():
-    role, requested = auth._resolve_role_for_new_user(
-        _StubSession(user_count=5), "official1", "official", config.ADMIN_ACCESS_CODE
-    )
-    assert role == auth.ROLE_ADMIN
-    assert requested == ""
-
-
-def test_an_access_code_from_a_non_official_signup_is_ignored():
-    """The code only applies to someone who declared themselves an official;
-    it must not become a general-purpose backdoor on every sign-up."""
-    role, _ = auth._resolve_role_for_new_user(
-        _StubSession(user_count=5), "citizen1", "citizen", config.ADMIN_ACCESS_CODE
-    )
-    assert role == auth.ROLE_USER
-
-
-def test_named_admins_are_granted_regardless_of_account_type(monkeypatch):
+def test_named_admins_are_granted(monkeypatch):
+    """The deployment operator's decision, made out of band."""
     monkeypatch.setattr(config, "ADMIN_USERNAMES", {"named.admin"})
-    role, requested = auth._resolve_role_for_new_user(
-        _StubSession(user_count=5), "Named.Admin", "citizen", ""
+    assert auth._resolve_role_for_new_user(
+        _StubSession(user_count=5), "Named.Admin"
+    ) == auth.ROLE_ADMIN
+
+
+def test_registration_takes_no_privilege_input_at_all():
+    """The property the whole role model rests on.
+
+    The sign-up payload has no field - not `role`, not `account_type`, not
+    `access_code` - that can influence what `_resolve_role_for_new_user`
+    returns. Privilege is decided from the username and the database, and from
+    nothing the client sends. A privilege field reappearing here is the exact
+    regression this test exists to catch.
+    """
+    assert set(auth.UserRegister.model_fields) == {
+        "username", "password", "full_name", "email",
+    }
+
+
+def test_an_unknown_field_in_the_payload_is_dropped_not_honoured():
+    """An older client still posting role/account_type/access_code must be
+    accepted, with the values discarded rather than acted on."""
+    payload = auth.UserRegister(
+        username="citizen1",
+        password="correct1horse",
+        role="admin",
+        account_type="official",
+        access_code="anything",
     )
-    assert role == auth.ROLE_ADMIN
-    assert requested == ""
+    assert not hasattr(payload, "role")
+    assert not hasattr(payload, "access_code")
+    assert payload.username == "citizen1"
+
+
+def test_the_access_request_model_carries_a_reason_and_a_code():
+    """Privilege is now requested from inside the app, authenticated."""
+    request = auth.AccessRequest(reason="I manage the finance archive.")
+    assert request.reason == "I manage the finance archive."
+    assert request.access_code == ""
 
 
 # --- Validation --------------------------------------------------------------

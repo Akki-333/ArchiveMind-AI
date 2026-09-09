@@ -99,6 +99,25 @@ export const updateProfile = (profile) => api.put('/api/auth/me', profile).then(
 export const updatePassword = (payload) =>
   api.put('/api/auth/me/password', payload).then((r) => r.data);
 
+/**
+ * Ask for administrator access from inside the app.
+ * A valid code grants it immediately; anything else records a pending request.
+ */
+export const requestAdminAccess = (payload) =>
+  api.post('/api/auth/request-access', payload).then((r) => r.data);
+
+export const withdrawAccessRequest = () =>
+  api.delete('/api/auth/request-access').then((r) => r.data);
+
+/** Admin only. Small and cheap, so the notification badge can poll it. */
+export const fetchAccessRequests = () =>
+  api.get('/api/auth/access-requests').then((r) => r.data);
+
+export const declineAccessRequest = (username) =>
+  api
+    .post(`/api/auth/access-requests/${encodeURIComponent(username)}/decline`)
+    .then((r) => r.data);
+
 export const fetchUsers = () => api.get('/api/auth/users').then((r) => r.data.users);
 
 export const updateUserRole = (username, role) =>
@@ -167,6 +186,7 @@ export async function streamMessage(message, sessionId, handlers = {}) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({ message, session_id: sessionId }),
@@ -244,6 +264,45 @@ export async function streamMessage(message, sessionId, handlers = {}) {
   if (streamError) throw new Error(streamError);
   if (!final) throw new Error('The answer ended unexpectedly. Please try again.');
   return final;
+}
+
+/**
+ * Ask a question, streaming when the network allows it and falling back when
+ * it does not.
+ *
+ * This exists because the deployed backend sits behind Hugging Face Spaces'
+ * SvelteKit reverse proxy, which buffers responses. Server-sent events either
+ * arrive in one lump at the end or not at all, so a chat screen wired only to
+ * `streamMessage` works perfectly in local development and appears completely
+ * broken in production - the failure mode that is hardest to diagnose, because
+ * nothing is wrong with the code you are looking at.
+ *
+ * The fallback is not a downgrade in correctness: `/api/chat` and
+ * `/api/chat/stream` run the same retrieval, the same grounding and the same
+ * citations through `_plan_answer`. Only the delivery differs.
+ *
+ * `onFallback` lets the UI swap a token-by-token caret for an honest "working
+ * on it" state instead of leaving a caret blinking at nothing.
+ */
+export async function askQuestion(message, sessionId, handlers = {}) {
+  try {
+    return await streamMessage(message, sessionId, handlers);
+  } catch (error) {
+    // A 401 already cleared the session; re-running the question would only
+    // produce a second failure.
+    if (/session has expired/i.test(error?.message || '')) throw error;
+
+    // A rate limit or an explicit server refusal is a real answer, not a
+    // transport problem - retrying would burn the user's remaining quota.
+    if (/too many|unavailable|too quickly/i.test(error?.message || '')) throw error;
+
+    handlers.onFallback?.();
+    const data = await sendMessage(message, sessionId);
+    handlers.onCitations?.(data.citations || []);
+    handlers.onToken?.(data.answer || '');
+    handlers.onDone?.(data);
+    return data;
+  }
 }
 
 /**

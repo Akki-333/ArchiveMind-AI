@@ -7,7 +7,7 @@ import {
 
 import {
   createSession, deleteSession, editMessage, errorMessage, fetchHistory,
-  fetchSessions, renameSession, streamMessage,
+  askQuestion, fetchSessions, renameSession,
 } from '../api';
 import { ChatMessage, NewChatModal, EmptyState, Spinner } from '../components/common';
 
@@ -243,8 +243,11 @@ const ChatScreen = ({
       });
 
     try {
-      await streamMessage(text, activeSessionId, {
+      await askQuestion(text, activeSessionId, {
         onStatus: setStage,
+        // The proxy in front of the deployed backend buffers SSE, so the
+        // answer may arrive whole. Say so rather than blinking a caret.
+        onFallback: () => setStage('writing'),
         // Citations arrive before the prose, so the sources render while the
         // answer is still being written.
         onCitations: (citations) => patchLast({ citations }),

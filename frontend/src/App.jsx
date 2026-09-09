@@ -9,7 +9,7 @@ import {
   clearSession, fetchDocuments, fetchHistory, fetchIdentity, fetchSessions,
   setUnauthorizedHandler, storedSession,
 } from './api';
-import { SettingsPanel, SidebarLink, Spinner } from './components/common';
+import { AccessRequestBell, SettingsPanel, SidebarLink, Spinner } from './components/common';
 import { AuthScreen } from './pages/AuthScreen';
 import logoImg from './assets/logo.jpg';
 
@@ -107,6 +107,25 @@ const App = () => {
 
   }, [handleLogout]);
 
+  /**
+   * Re-read the server's view of who we are.
+   *
+   * Called after a role changes - an access request granted, or an
+   * administrator approving someone. Without it the sidebar keeps rendering
+   * the old role until a manual reload, which makes a successful action look
+   * like it did nothing.
+   */
+  const refreshIdentity = useCallback(() => {
+    fetchIdentity()
+      .then((identity) => {
+        if (!identity?.username) return;
+        setRole(identity.role || 'user');
+        setDisplayName(identity.full_name || '');
+        localStorage.setItem('role', identity.role || 'user');
+      })
+      .catch(() => {});
+  }, []);
+
   const refreshDocuments = useCallback(() => {
     if (!isAuthenticated) return;
     fetchDocuments().then(setDocuments).catch(() => {});
@@ -140,15 +159,30 @@ const App = () => {
     );
   }
 
+  /**
+   * The Router wraps the sign-in screen too.
+   *
+   * It used to wrap only the authenticated tree, with an early return above it
+   * for AuthScreen. That had two consequences, both visible in production:
+   * opening /graph directly rendered the login form with no route context, and
+   * signing in always landed you on the dashboard, because the URL you asked
+   * for was never part of the routing tree to begin with.
+   *
+   * With the Router outermost the browser URL is untouched by signing in, so
+   * /graph is still /graph when the authenticated routes mount, and it renders
+   * the screen you actually asked for.
+   */
   if (!isAuthenticated) {
     return (
-      <AuthScreen
-        onLogin={(user, userRole) => {
-          setUsername(user);
-          setRole(userRole);
-          setIsAuthenticated(true);
-        }}
-      />
+      <Router>
+        <AuthScreen
+          onLogin={(user, userRole) => {
+            setUsername(user);
+            setRole(userRole);
+            setIsAuthenticated(true);
+          }}
+        />
+      </Router>
     );
   }
 
@@ -167,6 +201,7 @@ const App = () => {
             username={username}
             role={role}
             onProfileSaved={(profile) => setDisplayName(profile.full_name || '')}
+            onRoleChanged={refreshIdentity}
           />
         )}
 
@@ -179,7 +214,7 @@ const App = () => {
           </div>
 
           <nav className="flex-1 p-3 space-y-1.5 overflow-y-auto">
-            <SidebarLink to="/" icon={LayoutDashboard}>Dashboard</SidebarLink>
+            <SidebarLink to="/dashboard" icon={LayoutDashboard}>Dashboard</SidebarLink>
             <SidebarLink to="/chat" icon={MessageSquare}>Semantic Chat</SidebarLink>
             <SidebarLink to="/graph" icon={Network}>Knowledge Graph</SidebarLink>
             <SidebarLink to="/compare" icon={GitCompare}>Compare</SidebarLink>
@@ -211,6 +246,7 @@ const App = () => {
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">
+              {isAdmin && <AccessRequestBell onHandled={refreshIdentity} />}
               <button
                 onClick={() => setShowSettings(true)}
                 className="text-slate-400 hover:text-sky-500 p-2 rounded-lg hover:bg-sky-50 dark:hover:bg-sky-900/30"
@@ -232,8 +268,15 @@ const App = () => {
         <main className="flex-1 overflow-y-auto dark:bg-slate-900 dark:text-slate-100 min-w-0">
           <Suspense fallback={<RouteFallback />}>
             <Routes>
+            {/*
+              Every menu entry has its own URL, and "/" is an alias rather than
+              a screen. A bare "/" carrying the dashboard meant the address bar
+              never told you where you were, and there was no path to link
+              someone to the dashboard specifically.
+            */}
+            <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route
-              path="/"
+              path="/dashboard"
               element={
                 isAdmin ? (
                   <Dashboard
@@ -291,17 +334,17 @@ const App = () => {
                 isAdmin ? (
                   <UploadScreen documents={documents} onUploadSuccess={refreshDocuments} />
                 ) : (
-                  <Navigate to="/" replace />
+                  <Navigate to="/dashboard" replace />
                 )
               }
             />
             <Route
               path="/people"
               element={
-                isAdmin ? <UsersScreen currentUsername={username} /> : <Navigate to="/" replace />
+                isAdmin ? <UsersScreen currentUsername={username} /> : <Navigate to="/dashboard" replace />
               }
             />
-            <Route path="*" element={<Navigate to="/" replace />} />
+            <Route path="*" element={<Navigate to="/dashboard" replace />} />
             </Routes>
           </Suspense>
         </main>
