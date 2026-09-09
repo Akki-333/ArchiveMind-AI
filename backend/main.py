@@ -78,11 +78,21 @@ async def lifespan(app: FastAPI):
     logger.info("ArchiveMind AI stopped.")
 
 
+# The interactive docs are genuinely useful in development and are free
+# reconnaissance in production: /openapi.json enumerates every route, its
+# payload shape and which ones are privileged. Nothing there is secret, but a
+# public service need not hand an attacker the map. Any ENVIRONMENT other than
+# "production" keeps them.
+_docs_enabled = not config.IS_PRODUCTION
+
 app = FastAPI(
     title="ArchiveMind AI API",
     version="2.0.0",
     description="Hybrid GraphRAG over government policy documents.",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
 # "*" with credentials is rejected by browsers, so the origins are explicit.

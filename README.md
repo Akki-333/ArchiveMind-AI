@@ -1,3 +1,13 @@
+---
+title: ArchiveMind AI
+emoji: 🧠
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" />
   <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white" />
@@ -362,6 +372,97 @@ crashes when those break; answers and diagrams just quietly get worse.
 CI additionally runs an import smoke test asserting that the core routes still
 register and that `/health/db` and `/health/config` still require an
 administrator.
+
+---
+
+## Deployment
+
+The backend is a container; the frontend is static files. They deploy
+separately and are joined by two environment variables.
+
+### 1. Backend — Hugging Face Spaces
+
+The `Dockerfile` already targets it: port 7860, and the embedding model is
+pre-downloaded at build time so the platform's health check does not time out
+waiting for a 90 MB download on the first request.
+
+```bash
+# Create a Space (SDK: Docker) at huggingface.co/new-space, then:
+git remote add space https://huggingface.co/spaces/<you>/archivemind-ai
+git push space main
+```
+
+In **Settings → Variables and secrets**, add these as *secrets*:
+
+| Secret | Notes |
+|---|---|
+| `JWT_SECRET` | `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `PINECONE_API_KEY` | |
+| `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` | AuraDB connection |
+| `GROQ_API_KEY` | plus any other provider keys |
+| `ADMIN_ACCESS_CODE` | optional; lets an official claim admin at sign-up |
+
+and these as plain *variables*:
+
+| Variable | Value |
+|---|---|
+| `ENVIRONMENT` | `production` |
+| `CORS_ORIGINS` | your frontend URL — set after step 2 |
+
+`ENVIRONMENT=production` is not cosmetic. It makes `JWT_SECRET` mandatory, so
+the app refuses to start on an ephemeral key rather than silently signing
+everyone out on each restart, and it disables `/docs`, `/redoc` and
+`/openapi.json`.
+
+### 2. Frontend — Vercel
+
+Import the repository and set **Root Directory** to `frontend`. `vercel.json`
+supplies the build command, the output directory and the SPA rewrite that stops
+`/chat` and `/graph` returning 404 on a refresh.
+
+Add one environment variable:
+
+| Variable | Value |
+|---|---|
+| `VITE_API_URL` | `https://<you>-archivemind-ai.hf.space` |
+
+Vite inlines this at build time, so changing it needs a redeploy, not a restart.
+
+### 3. Close the loop
+
+The two services have to learn each other's URLs, and the order matters:
+
+1. Deploy the backend, note its `*.hf.space` URL.
+2. Deploy the frontend with `VITE_API_URL` pointing at it.
+3. Go back and set `CORS_ORIGINS` on the Space to the Vercel URL, then restart.
+
+Until step 3 the browser blocks every request, and the failure looks like a
+network error rather than a configuration one.
+
+### 4. Verify
+
+```bash
+curl https://<you>-archivemind-ai.hf.space/health      # {"status":"ok"} - public
+```
+
+Then sign in as an administrator and open **Dashboard → System Health**, which
+performs real round-trips. For a one-off check that the LLM chain can actually
+complete — the thing a configuration probe cannot tell you — call
+`/health/db?deep=1` with an admin token. It is rate-limited and cached
+deliberately: it bills a completion.
+
+The first account created on an empty database becomes the administrator.
+
+### Notes
+
+- **Cold starts.** A free Space sleeps after inactivity; the first request
+  afterwards pays the container start plus the model load. Subsequent requests
+  are warm.
+- **One worker.** The rate limiter and the login throttle are per-process,
+  which is correct for the single-process `CMD` in the `Dockerfile`. Adding
+  `--workers` silently breaks both — move the store to Redis first.
+- **The YAML block at the top of this file** is the Space configuration. Remove
+  it only if you deploy elsewhere.
 
 ---
 
