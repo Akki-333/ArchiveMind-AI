@@ -9,11 +9,15 @@
  */
 import axios from 'axios';
 
-let resolvedBaseUrl = import.meta.env.VITE_API_URL || (
-  import.meta.env.PROD
+let resolvedBaseUrl = import.meta.env.VITE_API_URL || '';
+
+// Fall back to live Hugging Face Space if unset or if pointing to legacy onrender.com
+if (!resolvedBaseUrl || resolvedBaseUrl.includes('onrender.com')) {
+  resolvedBaseUrl = import.meta.env.PROD
     ? 'https://akki445-archivemind-backend.hf.space/gradio_api'
-    : 'http://127.0.0.1:8000'
-);
+    : 'http://127.0.0.1:8000';
+}
+
 if (resolvedBaseUrl.includes('.hf.space') && !resolvedBaseUrl.endsWith('/gradio_api')) {
   resolvedBaseUrl = resolvedBaseUrl.replace(/\/+$/, '') + '/gradio_api';
 }
