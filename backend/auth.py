@@ -268,13 +268,22 @@ def _resolve_role_for_new_user(session, username: str) -> str:
 
 
 def _fetch_user(username: str) -> Optional[dict]:
-    with neo4j_driver.session() as session:
-        record = session.run(
-            "MATCH (u:User {username: $username}) "
-            "RETURN u.username AS username, u.role AS role, u.password_hash AS password_hash",
-            username=username,
-        ).single()
-    return dict(record) if record else None
+    try:
+        with neo4j_driver.session() as session:
+            record = session.run(
+                "MATCH (u:User {username: $username}) "
+                "RETURN u.username AS username, u.role AS role, u.password_hash AS password_hash",
+                username=username,
+            ).single()
+        return dict(record) if record else None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Database error while fetching user '%s': %s", username, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection error. If using Neo4j AuraDB Free, please check if your database is paused at console.neo4j.io.",
+        )
 
 
 def _fetch_profile(username: str) -> dict:
@@ -395,7 +404,10 @@ def register_user(user: UserRegister):
             if "ConstraintValidation" in type(exc).__name__ or "already exists" in str(exc):
                 raise HTTPException(status_code=409, detail="That username is already taken.")
             logger.exception("Registration failed for '%s'", username)
-            raise HTTPException(status_code=500, detail="Could not create the account.")
+            raise HTTPException(
+                status_code=503,
+                detail="Database connection error. If using Neo4j AuraDB Free, please check if your database is paused at console.neo4j.io.",
+            )
 
     return {
         "message": "Account created.",
